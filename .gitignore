@@ -2,3 +2,5 @@
 src.bak
 *.log
 .aider*
+
+/.cargo/

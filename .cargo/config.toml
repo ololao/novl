@@ -1,7 +1,0 @@
-[target.aarch64-linux-android]
-ar = "/home/ooopev/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-linker = "/home/ooopev/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
-
-[env]
-CC_aarch64_linux_android = "/home/ooopev/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
-AR_aarch64_linux_android = "/home/ooopev/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
