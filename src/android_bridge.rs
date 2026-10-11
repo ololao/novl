@@ -2,24 +2,24 @@ use crate::client::{ClientConfig, TransportMode};
 use jni_sys::{jclass, jint, jobject, jstring, JNIEnv, JavaVM, JNI_OK, JNI_VERSION_1_6};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::RwLock;
+use std::sync::Mutex;
 use tun2proxy::{ArgDns, Args, CancellationToken, ProxyParameters};
 
 struct VmWrapper(*mut JavaVM);
 unsafe impl Send for VmWrapper {}
 unsafe impl Sync for VmWrapper {}
 
-struct ObjWrapper(jobject);
-unsafe impl Send for ObjWrapper {}
-unsafe impl Sync for ObjWrapper {}
+/// A registered `VpnService` and the resolved `protect(I)Z` method. The service
+/// reference is a JNI global reference whose lifetime is owned by this struct.
+struct VpnServiceState {
+    service: jobject,
+    protect_method: jni_sys::jmethodID,
+}
+unsafe impl Send for VpnServiceState {}
+unsafe impl Sync for VpnServiceState {}
 
-struct MethodWrapper(jni_sys::jmethodID);
-unsafe impl Send for MethodWrapper {}
-unsafe impl Sync for MethodWrapper {}
-
-static JVM: RwLock<Option<VmWrapper>> = RwLock::new(None);
-static VPN_SERVICE: RwLock<Option<ObjWrapper>> = RwLock::new(None);
-static PROTECT_METHOD: RwLock<Option<MethodWrapper>> = RwLock::new(None);
+static JVM: Mutex<Option<VmWrapper>> = Mutex::new(None);
+static VPN_STATE: Mutex<Option<VpnServiceState>> = Mutex::new(None);
 
 struct ActiveTunnel {
     handle: i32,
@@ -28,29 +28,31 @@ struct ActiveTunnel {
     runtime: tokio::runtime::Runtime,
 }
 
-static ACTIVE_TUNNEL: RwLock<Option<ActiveTunnel>> = RwLock::new(None);
+static ACTIVE_TUNNEL: Mutex<Option<ActiveTunnel>> = Mutex::new(None);
 static NEXT_HANDLE: AtomicI32 = AtomicI32::new(1);
 
 /// Exempts an outbound socket from the Android VPN routing table so its packets
 /// reach the physical network (Wi-Fi/Cellular) directly without creating a routing loop.
 pub fn protect_socket(fd: std::os::unix::io::RawFd) -> anyhow::Result<()> {
     let vm_ptr = {
-        let lock = JVM.read().unwrap();
+        let lock = JVM.lock().unwrap();
         lock.as_ref().map(|w| w.0)
     };
-    let service_ref = {
-        let lock = VPN_SERVICE.read().unwrap();
-        lock.as_ref().map(|w| w.0)
-    };
-    let mid = {
-        let lock = PROTECT_METHOD.read().unwrap();
-        lock.as_ref().map(|w| w.0)
+    let vm = match vm_ptr {
+        Some(v) => v,
+        None => {
+            // Not running under the Android JVM (e.g. desktop/test suite).
+            return Ok(());
+        }
     };
 
-    let (vm, service, mid) = match (vm_ptr, service_ref, mid) {
-        (Some(vm), Some(srv), Some(m)) => (vm, srv, m),
-        _ => {
-            // Not running under Android VpnService (e.g. desktop/test suite)
+    // Hold the VPN state lock for the entire JNI call so the global reference can
+    // never be deleted (by wgRegisterVpnService) while we're using it (N04).
+    let state_lock = VPN_STATE.lock().unwrap();
+    let state = match state_lock.as_ref() {
+        Some(s) => s,
+        None => {
+            // No VpnService registered (e.g. desktop/test suite).
             return Ok(());
         }
     };
@@ -73,16 +75,23 @@ pub fn protect_socket(fd: std::os::unix::io::RawFd) -> anyhow::Result<()> {
             (attached_env as *mut JNIEnv, true)
         };
 
-        let ok = ((**env).v1_6.CallBooleanMethod)(env, service, mid, fd as jint);
-        if !ok {
-            log::warn!("VpnService.protect(fd={}) returned false", fd);
-        } else {
-            log::debug!("VpnService.protect(fd={}) succeeded", fd);
-        }
+        let ok = ((**env).v1_6.CallBooleanMethod)(
+            env,
+            state.service,
+            state.protect_method,
+            fd as jint,
+        );
 
         if must_detach {
             let _ = ((**vm).v1_2.DetachCurrentThread)(vm);
         }
+
+        if !ok {
+            // A routing loop is possible if the socket is not protected. Treat this as a
+            // hard error so the connection is aborted instead of continuing unprotected (N05).
+            anyhow::bail!("VpnService.protect(fd={}) returned false", fd);
+        }
+        log::debug!("VpnService.protect(fd={}) succeeded", fd);
     }
     Ok(())
 }
@@ -106,68 +115,88 @@ unsafe fn string_to_jstring(env: *mut JNIEnv, s: &str) -> jstring {
     ((**env).v1_6.NewStringUTF)(env, cstr.as_ptr())
 }
 
-fn parse_endpoint_from_settings(settings: &str) -> Option<SocketAddr> {
+fn parse_socket_addr(val: &str) -> Option<SocketAddr> {
+    if let Ok(addr) = val.parse::<SocketAddr>() {
+        return Some(addr);
+    }
+    // Domain name resolution fallback.
+    val.to_socket_addrs()
+        .ok()
+        .and_then(|mut addrs| addrs.next())
+}
+
+/// Settings as parsed from the `wgTurnOn` settings string. The endpoint and the
+/// pre-shared key are always taken from the *same* (first) peer section.
+struct ParsedSettings {
+    endpoint: Option<SocketAddr>,
+    secret: Option<String>,
+    sni: String,
+    dns: IpAddr,
+}
+
+fn parse_settings(settings: &str) -> ParsedSettings {
+    let mut sni = "addons.mozilla.org".to_string();
+    let mut dns: IpAddr = "1.1.1.1".parse().unwrap();
+
+    // The engine only supports a single remote server, so we use the first peer's
+    // endpoint and PSK together (rather than independently scanning for whichever
+    // "endpoint=" or "preshared_key=" line happens to appear first, which could
+    // mix values from different peers — N08).
+    let mut first_peer_endpoint: Option<SocketAddr> = None;
+    let mut first_peer_secret: Option<String> = None;
+    let mut saw_first_peer = false;
+
+    let mut cur_endpoint: Option<SocketAddr> = None;
+    let mut cur_secret: Option<String> = None;
+    let mut in_peer = false;
+
     for line in settings.lines() {
         let line = line.trim();
-        if let Some(val) = line.strip_prefix("endpoint=") {
-            let val = val.trim();
-            if let Ok(addr) = val.parse::<SocketAddr>() {
-                return Some(addr);
+        if line.starts_with("public_key=") {
+            if !saw_first_peer {
+                saw_first_peer = true;
+                first_peer_endpoint = cur_endpoint.take();
+                first_peer_secret = cur_secret.take();
+            } else {
+                break;
             }
-            // Domain name resolution fallback
-            if let Ok(mut addrs) = val.to_socket_addrs() {
-                if let Some(addr) = addrs.next() {
-                    return Some(addr);
+            in_peer = true;
+            continue;
+        }
+        if let Some(val) = line.strip_prefix("sni=") {
+            let val = val.trim();
+            if !val.is_empty() {
+                sni = val.to_string();
+            }
+        } else if let Some(val) = line.strip_prefix("dns=") {
+            if let Ok(ip) = val.trim().parse::<IpAddr>() {
+                dns = ip;
+            }
+        } else if in_peer {
+            if let Some(val) = line.strip_prefix("endpoint=") {
+                if cur_endpoint.is_none() {
+                    cur_endpoint = parse_socket_addr(val.trim());
+                }
+            } else if let Some(val) = line.strip_prefix("preshared_key=") {
+                let val = val.trim();
+                if cur_secret.is_none() && !val.is_empty() {
+                    cur_secret = Some(val.to_string());
+                }
+            } else if let Some(val) = line.strip_prefix("secret=") {
+                let val = val.trim();
+                if cur_secret.is_none() && !val.is_empty() {
+                    cur_secret = Some(val.to_string());
                 }
             }
         }
     }
-    None
-}
 
-fn parse_secret_from_settings(settings: &str) -> String {
-    for line in settings.lines() {
-        let line = line.trim();
-        if let Some(val) = line.strip_prefix("preshared_key=") {
-            let val = val.trim();
-            if !val.is_empty() {
-                return val.to_string();
-            }
-        }
-        if let Some(val) = line.strip_prefix("secret=") {
-            let val = val.trim();
-            if !val.is_empty() {
-                return val.to_string();
-            }
-        }
+    ParsedSettings {
+        endpoint: first_peer_endpoint,
+        secret: first_peer_secret,
+        sni,
+        dns,
     }
-    "default-novl-secret".to_string()
-}
-
-fn parse_sni_from_settings(settings: &str) -> String {
-    for line in settings.lines() {
-        let line = line.trim();
-        if let Some(val) = line.strip_prefix("sni=") {
-            let val = val.trim();
-            if !val.is_empty() {
-                return val.to_string();
-            }
-        }
-    }
-    "addons.mozilla.org".to_string()
-}
-
-fn parse_dns_from_settings(settings: &str) -> IpAddr {
-    for line in settings.lines() {
-        let line = line.trim();
-        if let Some(val) = line.strip_prefix("dns=") {
-            let val = val.trim();
-            if let Ok(ip) = val.parse::<IpAddr>() {
-                return ip;
-            }
-        }
-    }
-    "1.1.1.1".parse().unwrap()
 }
 
 /// # Safety
@@ -187,7 +216,7 @@ pub unsafe extern "system" fn JNI_OnLoad(
                 .with_max_level(log::LevelFilter::Debug),
         );
     }
-    let mut lock = JVM.write().unwrap();
+    let mut lock = JVM.lock().unwrap();
     *lock = Some(VmWrapper(vm));
     log::info!("Novl JNI_OnLoad initialized successfully");
     JNI_VERSION_1_6
@@ -203,13 +232,11 @@ pub unsafe extern "system" fn Java_com_wireguard_android_backend_GoBackend_wgReg
     _class: jclass,
     service: jobject,
 ) {
-    let mut srv_lock = VPN_SERVICE.write().unwrap();
-    let mut mid_lock = PROTECT_METHOD.write().unwrap();
+    let mut state_lock = VPN_STATE.lock().unwrap();
 
-    if let Some(old) = srv_lock.take() {
-        ((**env).v1_6.DeleteGlobalRef)(env, old.0);
+    if let Some(old) = state_lock.take() {
+        ((**env).v1_6.DeleteGlobalRef)(env, old.service);
     }
-    *mid_lock = None;
 
     if service.is_null() {
         log::info!("VpnService unregistered from Novl engine");
@@ -223,8 +250,10 @@ pub unsafe extern "system" fn Java_com_wireguard_android_backend_GoBackend_wgReg
     let mid = ((**env).v1_6.GetMethodID)(env, cls, method_name.as_ptr(), method_sig.as_ptr());
     ((**env).v1_6.DeleteLocalRef)(env, cls);
 
-    *srv_lock = Some(ObjWrapper(global_ref));
-    *mid_lock = Some(MethodWrapper(mid));
+    *state_lock = Some(VpnServiceState {
+        service: global_ref,
+        protect_method: mid,
+    });
     log::info!("VpnService registered with Novl engine for socket protection");
 }
 
@@ -245,24 +274,30 @@ pub unsafe extern "system" fn Java_com_wireguard_android_backend_GoBackend_wgTur
     let settings_str = jstring_to_string(env, settings);
     log::info!("wgTurnOn invoked: ifname={}, tun_fd={}", ifname_str, tun_fd);
 
-    // Terminate any previous tunnel session cleanly
-    {
-        let mut lock = ACTIVE_TUNNEL.write().unwrap();
-        if let Some(existing) = lock.take() {
-            log::warn!("Stopping previous tunnel handle {}", existing.handle);
-            let _ = existing.shutdown_tx.send(true);
-            existing.tun2proxy_token.cancel();
-            existing
-                .runtime
-                .shutdown_timeout(std::time::Duration::from_millis(500));
-        }
-    }
+    let parsed = parse_settings(&settings_str);
 
-    let server_addr = parse_endpoint_from_settings(&settings_str)
-        .unwrap_or_else(|| "127.0.0.1:7443".parse().unwrap());
-    let secret = parse_secret_from_settings(&settings_str);
-    let server_sni = parse_sni_from_settings(&settings_str);
-    let dns_addr = parse_dns_from_settings(&settings_str);
+    // Refuse to start when the endpoint is missing (N09). Never substitute a
+    // hard-coded public server address.
+    let server_addr = match parsed.endpoint {
+        Some(addr) => addr,
+        None => {
+            log::error!("No endpoint configured for tunnel; refusing to start");
+            return -1;
+        }
+    };
+
+    // Refuse to start without a pre-shared key (N01). Never fall back to a
+    // published default secret, which would let anyone derive the transport keys.
+    let secret = match parsed.secret {
+        Some(secret) => secret,
+        None => {
+            log::error!("No pre-shared key configured for tunnel; refusing to start");
+            return -1;
+        }
+    };
+
+    let server_sni = parsed.sni;
+    let dns_addr = parsed.dns;
 
     log::info!(
         "Configuring Novl engine: server={}, sni={}, dns={}, secret_len={}",
@@ -355,7 +390,7 @@ pub unsafe extern "system" fn Java_com_wireguard_android_backend_GoBackend_wgTur
     });
 
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::SeqCst);
-    let mut lock = ACTIVE_TUNNEL.write().unwrap();
+    let mut lock = ACTIVE_TUNNEL.lock().unwrap();
     *lock = Some(ActiveTunnel {
         handle,
         shutdown_tx,
@@ -378,7 +413,7 @@ pub unsafe extern "system" fn Java_com_wireguard_android_backend_GoBackend_wgTur
     handle: jint,
 ) {
     log::info!("wgTurnOff requested for handle {}", handle);
-    let mut lock = ACTIVE_TUNNEL.write().unwrap();
+    let mut lock = ACTIVE_TUNNEL.lock().unwrap();
     if let Some(tunnel) = lock.as_ref() {
         if tunnel.handle == handle {
             if let Some(t) = lock.take() {

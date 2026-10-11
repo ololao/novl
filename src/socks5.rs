@@ -82,6 +82,17 @@ impl TargetAddress {
             TargetAddress::IPv6(ip, port) => (format!("[{}]", ip), *port),
         }
     }
+
+    /// Returns a concrete `SocketAddr` for numeric IP targets, or `None` for
+    /// domains that must be resolved via DNS. This avoids the lossy `"[addr]"`
+    /// bracketed string form when handing addresses to the resolver (N10).
+    pub fn to_socket_addr(&self) -> Option<SocketAddr> {
+        match self {
+            TargetAddress::IPv4(ip, port) => Some(SocketAddr::from((*ip, *port))),
+            TargetAddress::IPv6(ip, port) => Some(SocketAddr::from((*ip, *port))),
+            TargetAddress::Domain(..) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

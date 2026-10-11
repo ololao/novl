@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 use byteorder::{BigEndian, ByteOrder};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -61,6 +61,50 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
             }
         }
     }
+}
+
+/// Whether an IP address must not be reachable through the tunnel: loopback,
+/// link-local, private, multicast, broadcast, or the unspecified address.
+fn ip_is_restricted(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_multicast()
+                || ip.octets()[0] == 0
+        }
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip.is_multicast()
+                || ip.is_unicast_link_local()
+                || ((ip.segments()[0] & 0xfe00) == 0xfc00)
+                || ip.is_unspecified()
+        }
+    }
+}
+
+/// Resolves a `TargetAddress` to a list of concrete `SocketAddr`s without ever
+/// passing a bracketed IPv6 string to the resolver (N10). Returns an empty list
+/// on resolution failure.
+async fn resolve_target_addrs(target: &TargetAddress) -> Vec<SocketAddr> {
+    match target {
+        TargetAddress::IPv4(..) | TargetAddress::IPv6(..) => {
+            target.to_socket_addr().into_iter().collect()
+        }
+        TargetAddress::Domain(domain, port) => {
+            match tokio::net::lookup_host((domain.as_str(), *port)).await {
+                Ok(addrs) => addrs.collect(),
+                Err(_) => Vec::new(),
+            }
+        }
+    }
+}
+
+fn target_desc(target: &TargetAddress) -> String {
+    let (host, port) = target.to_string_host_port();
+    format!("{}:{}", host, port)
 }
 
 async fn handle_connection(
@@ -182,9 +226,19 @@ async fn handle_connection(
                     break;
                 }
                 if let Ok((target, payload)) = unpack_tunnel_udp(&frame) {
-                    let (host, port) = target.to_string_host_port();
-                    if let Err(e) = udp_sock_tx.send_to(payload, (host.as_str(), port)).await {
-                        debug!("UDP send to {}:{} error: {}", host, port, e);
+                    // Resolve and reject restricted/private targets (N03).
+                    let addrs = resolve_target_addrs(&target).await;
+                    if addrs.iter().any(|a| ip_is_restricted(a.ip())) {
+                        debug!(
+                            "Dropping UDP datagram to restricted target {}",
+                            target_desc(&target)
+                        );
+                        continue;
+                    }
+                    if let Some(addr) = addrs.first() {
+                        if let Err(e) = udp_sock_tx.send_to(payload, *addr).await {
+                            debug!("UDP send to {} error: {}", addr, e);
+                        }
                     }
                 }
             }
@@ -219,6 +273,12 @@ async fn handle_connection(
             let mut packet_count = 0usize;
             while let Some(pkt) = rx_chan.recv().await {
                 packet_count += 1;
+                // Drop oversized datagrams instead of tearing down the whole
+                // association (N11).
+                if pkt.len() > crate::protocol::MAX_PAYLOAD_SIZE {
+                    debug!("Dropping oversized UDP datagram ({} bytes)", pkt.len());
+                    continue;
+                }
                 let pad = if packet_count < 10 {
                     (rand::random::<u8>() % 32) as u16
                 } else {
@@ -253,44 +313,36 @@ async fn handle_connection(
         &cmd_frame[..]
     };
 
-    fn is_private_or_restricted(target: &TargetAddress) -> bool {
-        match target {
-            TargetAddress::IPv4(ip, _) => {
-                ip.is_private()
-                    || ip.is_loopback()
-                    || ip.is_link_local()
-                    || ip.is_broadcast()
-                    || ip.is_multicast()
-                    || ip.octets()[0] == 0
-            }
-            TargetAddress::IPv6(ip, _) => {
-                ip.is_loopback()
-                    || ip.is_multicast()
-                    || ip.is_unicast_link_local()
-                    || ((ip.segments()[0] & 0xfe00) == 0xfc00)
-            }
-            TargetAddress::Domain(domain, _) => {
-                domain.eq_ignore_ascii_case("localhost") || domain.ends_with(".local")
-            }
-        }
-    }
-
     let (target, _) = TargetAddress::from_bytes(target_bytes)?;
-    let (host, port) = target.to_string_host_port();
 
-    if is_private_or_restricted(&target) {
+    // Resolve the target to concrete addresses and reject restricted/private
+    // addresses *before* connecting (N03). This also resolves domain names that
+    // could point at internal IPs.
+    let addrs = resolve_target_addrs(&target).await;
+    if addrs.is_empty() {
+        warn!(
+            "Failed to resolve target {} requested by {}",
+            target_desc(&target),
+            peer_addr
+        );
+        let fail_frame = encryptor.encrypt_frame(&[0x01], 16)?;
+        let _ = client_tx.write_all(&fail_frame).await;
+        return Ok(());
+    }
+    if addrs.iter().any(|a| ip_is_restricted(a.ip())) {
         debug!(
-            "Rejecting local/private target {}:{} from {}",
-            host, port, peer_addr
+            "Rejecting local/private target {} from {}",
+            target_desc(&target),
+            peer_addr
         );
         let fail_frame = encryptor.encrypt_frame(&[0x01], 16)?;
         let _ = client_tx.write_all(&fail_frame).await;
         return Ok(());
     }
 
-    debug!("Target request from {}: {}:{}", peer_addr, host, port);
+    debug!("Target request from {}: {}", peer_addr, target_desc(&target));
 
-    let connect_fut = TcpStream::connect((host.as_str(), port));
+    let connect_fut = TcpStream::connect(&addrs[..]);
     let target_sock = match tokio::time::timeout(Duration::from_secs(6), connect_fut).await {
         Ok(Ok(s)) => {
             let _ = s.set_nodelay(true);
@@ -301,13 +353,13 @@ async fn handle_connection(
             s
         }
         Ok(Err(e)) => {
-            warn!("Failed to connect to {}:{}: {}", host, port, e);
+            warn!("Failed to connect to {}: {}", target_desc(&target), e);
             let fail_frame = encryptor.encrypt_frame(&[0x01], 16)?;
             let _ = client_tx.write_all(&fail_frame).await;
             return Ok(());
         }
         Err(_) => {
-            warn!("Connect timeout (6s) to {}:{}", host, port);
+            warn!("Connect timeout (6s) to {}", target_desc(&target));
             let fail_frame = encryptor.encrypt_frame(&[0x01], 16)?;
             let _ = client_tx.write_all(&fail_frame).await;
             return Ok(());
@@ -365,10 +417,10 @@ async fn handle_connection(
         let _ = client_tx.shutdown().await;
     };
 
-    tokio::select! {
-        _ = c2t => {},
-        _ = t2c => {},
-    }
+    // Run both directions to completion so that a half-close (e.g. the client
+    // sending a request and shutting down its write side) does not cancel the
+    // reverse direction before the response is delivered (N12).
+    tokio::join!(c2t, t2c);
 
     Ok(())
 }

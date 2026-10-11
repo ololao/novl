@@ -14,7 +14,7 @@ async fn main() -> Result<()> {
 
     let mut listen_addr: SocketAddr = "0.0.0.0:7443".parse()?;
     let mut fallback_addr: SocketAddr = "127.0.0.1:8080".parse()?;
-    let mut secret = "default-novl-secret".to_string();
+    let mut secret = String::new();
 
     let args: Vec<String> = env::args().collect();
     let mut i = 1;
@@ -56,6 +56,14 @@ async fn main() -> Result<()> {
     info!("Starting novl-server {}", env!("CARGO_PKG_VERSION"));
     info!("Listen address:   {}", listen_addr);
     info!("Fallback address: {}", fallback_addr);
+
+    if secret.is_empty() {
+        anyhow::bail!(
+            "A pre-shared secret is required. Pass it with '--secret <SECRET>'. \
+             There is intentionally no default secret: a public default would let anyone \
+             derive the transport keys."
+        );
+    }
 
     let config = ServerConfig {
         listen_addr,

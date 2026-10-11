@@ -753,10 +753,14 @@ pub fn to_hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Hex decode helper
+/// Hex decode helper.
+///
+/// Parses the input byte-by-byte as ASCII hex, so it never slices a multi-byte
+/// UTF-8 character (which would panic) and works on any input, including
+/// strings with arbitrary Unicode content.
 pub fn from_hex(s: &str) -> Option<Vec<u8>> {
     let input = s.as_bytes();
-    if !input.len().is_multiple_of(2) {
+    if input.len() % 2 != 0 {
         return None;
     }
 
@@ -770,10 +774,12 @@ pub fn from_hex(s: &str) -> Option<Vec<u8>> {
     }
 
     let mut bytes = Vec::with_capacity(input.len() / 2);
-    for pair in input.as_chunks::<2>().0 {
-        let hi = hex_val(pair[0])?;
-        let lo = hex_val(pair[1])?;
+    let mut i = 0;
+    while i < input.len() {
+        let hi = hex_val(input[i])?;
+        let lo = hex_val(input[i + 1])?;
         bytes.push((hi << 4) | lo);
+        i += 2;
     }
     Some(bytes)
 }

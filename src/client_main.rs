@@ -15,7 +15,7 @@ async fn main() -> Result<()> {
     let mut socks5_listen: SocketAddr = "127.0.0.1:10800".parse()?;
     let mut server_addr: SocketAddr = "127.0.0.1:7443".parse()?;
     let mut server_sni = "addons.mozilla.org".to_string();
-    let mut secret = "default-novl-secret".to_string();
+    let mut secret = String::new();
     let mut mode = TransportMode::TlsChameleon;
     let mut http_path = "/novl".to_string();
     let mut split_pos: usize = 5;
@@ -104,6 +104,14 @@ async fn main() -> Result<()> {
             "Invalid configuration: TLS mode cannot be used on port 80. \
              DPI L7 inspection strictly validates HTTP on port 80; use '--mode http' for port 80 \
              or connect to a TLS port (e.g. 443)."
+        );
+    }
+
+    if secret.is_empty() {
+        anyhow::bail!(
+            "A pre-shared secret is required. Pass it with '--secret <SECRET>'. \
+             There is intentionally no default secret: a public default would let anyone \
+             derive the transport keys."
         );
     }
 

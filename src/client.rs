@@ -1,6 +1,7 @@
 use anyhow::{bail, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tracing::{debug, error, info};
@@ -174,6 +175,56 @@ pub async fn send_fragmented_handshake(
     send_desync_handshake(sock, data, &[split_pos], delay_ms).await
 }
 
+/// Reads the complete TLS ServerHello + ChangeCipherSpec response so that no
+/// leftover bytes remain in the stream to be misinterpreted as an encrypted
+/// frame (N06).
+async fn read_tls_server_hello(sock: &mut TcpStream) -> Result<()> {
+    let mut header = [0u8; 5];
+    tokio::time::timeout(Duration::from_secs(5), sock.read_exact(&mut header)).await??;
+    if header[0] != 0x16 {
+        bail!("Server returned non-TLS response (connection deflected). Verify master secret key!");
+    }
+    let rec_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+    if rec_len > crate::protocol::MAX_PAYLOAD_SIZE + 1024 {
+        bail!("Server hello record too large ({} bytes)", rec_len);
+    }
+    let mut body = vec![0u8; rec_len];
+    tokio::time::timeout(Duration::from_secs(5), sock.read_exact(&mut body)).await??;
+
+    // Consume the ChangeCipherSpec record (RFC 8446 middlebox compatibility).
+    let mut ccs = [0u8; 6];
+    tokio::time::timeout(Duration::from_secs(5), sock.read_exact(&mut ccs)).await??;
+    Ok(())
+}
+
+/// Reads the complete HTTP upgrade response up to the end of the header block,
+/// with size and time limits (N06).
+async fn read_http_upgrade_response(sock: &mut TcpStream) -> Result<()> {
+    let mut buf = Vec::with_capacity(512);
+    let mut tmp = [0u8; 512];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut tmp)).await??;
+        if n == 0 {
+            bail!("Server closed connection during HTTP handshake");
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        if buf.len() > 8192 {
+            bail!("HTTP response headers too large");
+        }
+    }
+    let resp_str = String::from_utf8_lossy(&buf);
+    if !resp_str.contains("101 Switching Protocols") {
+        bail!(
+            "Unexpected HTTP response from server (deflected): {}",
+            resp_str
+        );
+    }
+    Ok(())
+}
+
 async fn handle_client(
     mut client_sock: TcpStream,
     master_key: Arc<[u8; 32]>,
@@ -231,14 +282,7 @@ async fn handle_client(
             )
             .await?;
 
-            let mut server_hello_buf = vec![0u8; 512];
-            let n = remote_sock.read(&mut server_hello_buf).await?;
-            if n == 0 {
-                bail!("Server closed connection during TLS handshake");
-            }
-            if !server_hello_buf.starts_with(&[0x16]) {
-                bail!("Server returned non-TLS response (connection deflected). Verify master secret key!");
-            }
+            read_tls_server_hello(&mut remote_sock).await?;
             session_id
         }
         TransportMode::HttpUpgrade => {
@@ -248,18 +292,7 @@ async fn handle_client(
             send_desync_handshake(&mut remote_sock, &req, &split_points, config.split_delay_ms)
                 .await?;
 
-            let mut resp_buf = vec![0u8; 512];
-            let n = remote_sock.read(&mut resp_buf).await?;
-            if n == 0 {
-                bail!("Server closed connection during HTTP handshake");
-            }
-            let resp_str = String::from_utf8_lossy(&resp_buf[..n]);
-            if !resp_str.contains("101 Switching Protocols") {
-                bail!(
-                    "Unexpected HTTP response from server (deflected): {}",
-                    resp_str
-                );
-            }
+            read_http_upgrade_response(&mut remote_sock).await?;
             session_id
         }
     };
@@ -335,6 +368,12 @@ async fn handle_client(
                 let mut packet_count = 0usize;
                 while let Some(pkt) = rx_chan.recv().await {
                     packet_count += 1;
+                    // Drop oversized datagrams instead of tearing down the whole
+                    // UDP association (N11).
+                    if pkt.len() > crate::protocol::MAX_PAYLOAD_SIZE {
+                        debug!("Dropping oversized UDP datagram ({} bytes)", pkt.len());
+                        continue;
+                    }
                     let pad = if packet_count < 10 {
                         (rand::random::<u8>() % 32) as u16
                     } else {
@@ -460,10 +499,10 @@ async fn handle_client(
                 let _ = client_tx.shutdown().await;
             };
 
-            tokio::select! {
-                _ = c2r => {},
-                _ = r2c => {},
-            }
+            // Run both directions to completion so that a half-close (the local app
+            // sending a request and closing its write side) does not cancel the
+            // reverse direction before the response arrives (N12).
+            tokio::join!(c2r, r2c);
 
             Ok(())
         }
