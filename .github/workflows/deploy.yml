@@ -1,8 +1,3 @@
-# Исправленный workflow для репозитория `novl`
-# Куда положить: novl/.github/workflows/deploy.yml (заменить существующий файл)
-# Что проверено: YAML-валидность, соответствие CLI-аргументам novl-server (--listen/--fallback/--secret),
-# systemd-юниту (Restart=always) и структуре Cargo.toml (бинарник novl-server).
-
 name: Build & Deploy NOVL Server
 
 on:
@@ -131,7 +126,6 @@ jobs:
             set -euo pipefail
 
             echo "==> Deploying novl-server..."
-            chmod 755 "$REMOTE_NEW"
 
             BIN=/usr/local/bin/novl-server
             BACKUP=/usr/local/bin/novl-server.previous
@@ -145,7 +139,7 @@ jobs:
             rollback() {
               echo "::error::novl-server failed after deploy. Rolling back to previous version..." >&2
               if [ -f "$BACKUP" ]; then
-                $SUDO cp -f "$BACKUP" "$BIN"
+                $SUDO install -o root -g root -m 755 "$BACKUP" "$BIN"
                 $SUDO systemctl restart novl-server || true
               else
                 echo "::error::No previous version found; manual intervention required." >&2
@@ -158,8 +152,9 @@ jobs:
               $SUDO cp -f "$BIN" "$BACKUP"
             fi
 
-            # Атомарная замена через mv (предотвращает ошибку 'Text file busy')
-            $SUDO mv -f "$REMOTE_NEW" "$BIN"
+            # Атомарная замена + владелец/права root:root 755 одной командой
+            $SUDO install -o root -g root -m 755 "$REMOTE_NEW" "$BIN"
+            rm -f "$REMOTE_NEW"
             $SUDO systemctl restart novl-server
 
             # Даём systemd время обнаружить мгновенно падающий бинарник
