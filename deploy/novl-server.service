@@ -1,0 +1,21 @@
+[Unit]
+Description=NOVL Anti-DPI Transport Server
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/novl/server.env
+ExecStart=/bin/sh -c 'exec /usr/local/bin/novl-server --listen "${LISTEN_ADDR:-0.0.0.0:7443}" --fallback "${FALLBACK_ADDR:-127.0.0.1:8080}" --secret "${SECRET}"'
+Restart=always
+RestartSec=3s
+LimitNOFILE=65535
+
+# Hardening / Песочница безопасности systemd
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

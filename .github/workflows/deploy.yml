@@ -1,0 +1,122 @@
+name: Build & Deploy NOVL Server
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Cargo Tests
+        run: cargo test --verbose
+
+  build:
+    name: Build Release Binary
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build novl-server (Release)
+        run: cargo build --release --bin novl-server
+
+      - name: Upload Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: novl-server
+          path: target/release/novl-server
+          if-no-files-found: error
+          retention-days: 1
+
+  deploy:
+    name: Deploy to Server
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Binary Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: novl-server
+          path: ./artifacts
+
+      - name: Prepare SSH & Deploy
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT || '22' }}
+          SSH_PRIVATE_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          # 1. Проверяем обязательные секреты
+          if [ -z "$SERVER_HOST" ] || [ -z "$SERVER_USER" ] || [ -z "$SSH_PRIVATE_KEY" ]; then
+            echo "::error::Required secrets (SERVER_HOST, SERVER_USER, SERVER_SSH_KEY) are missing in GitHub repository settings!"
+            exit 1
+          fi
+
+          # 2. Настраиваем безопасный SSH-клиент
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+
+          # Сканируем хост-ключ сервера для защиты от атаки Man-in-the-Middle (MitM)
+          ssh-keyscan -p "$SERVER_PORT" -H "$SERVER_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          chmod 644 ~/.ssh/known_hosts
+
+          # 3. Копируем скомпилированный бинарник во временный файл на сервере
+          chmod +x ./artifacts/novl-server
+          scp -P "$SERVER_PORT" -i ~/.ssh/id_deploy ./artifacts/novl-server "${SERVER_USER}@${SERVER_HOST}:/tmp/novl-server.new"
+
+          # 4. Выполняем атомарную замену и перезапуск службы
+          ssh -p "$SERVER_PORT" -i ~/.ssh/id_deploy "${SERVER_USER}@${SERVER_HOST}" << 'EOF'
+            set -euo pipefail
+
+            echo "==> Deploying novl-server..."
+            chmod 755 /tmp/novl-server.new
+
+            # Атомарная замена исполняемого файла через mv (предотвращает ошибку 'Text file busy')
+            if [ "$(id -u)" -eq 0 ]; then
+              mv -f /tmp/novl-server.new /usr/local/bin/novl-server
+              systemctl restart novl-server
+              sleep 2
+              systemctl is-active --quiet novl-server
+            else
+              sudo mv -f /tmp/novl-server.new /usr/local/bin/novl-server
+              sudo systemctl restart novl-server
+              sleep 2
+              sudo systemctl is-active --quiet novl-server
+            fi
+
+            echo "==> Deployment successful: novl-server is active and running!"
+          EOF
