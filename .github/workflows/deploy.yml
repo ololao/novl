@@ -1,3 +1,8 @@
+# Исправленный workflow для репозитория `novl`
+# Куда положить: novl/.github/workflows/deploy.yml (заменить существующий файл)
+# Что проверено: YAML-валидность, соответствие CLI-аргументам novl-server (--listen/--fallback/--secret),
+# systemd-юниту (Restart=always) и структуре Cargo.toml (бинарник novl-server).
+
 name: Build & Deploy NOVL Server
 
 on:
@@ -6,6 +11,8 @@ on:
       - main
     paths:
       - 'src/**'
+      - 'tests/**'
+      - 'include/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/deploy.yml'
@@ -22,6 +29,7 @@ jobs:
   test:
     name: Run Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -39,6 +47,7 @@ jobs:
     name: Build Release Binary
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -52,11 +61,16 @@ jobs:
       - name: Build novl-server (Release)
         run: cargo build --release --bin novl-server
 
+      - name: Compute binary checksum
+        run: cd target/release && sha256sum novl-server > novl-server.sha256
+
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@v4
         with:
           name: novl-server
-          path: target/release/novl-server
+          path: |
+            target/release/novl-server
+            target/release/novl-server.sha256
           if-no-files-found: error
           retention-days: 1
 
@@ -64,6 +78,7 @@ jobs:
     name: Deploy to Server
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Download Binary Artifact
         uses: actions/download-artifact@v4
@@ -78,44 +93,87 @@ jobs:
           SERVER_PORT: ${{ secrets.SERVER_PORT || '22' }}
           SSH_PRIVATE_KEY: ${{ secrets.SERVER_SSH_KEY }}
         run: |
+          set -euo pipefail
+
           # 1. Проверяем обязательные секреты
           if [ -z "$SERVER_HOST" ] || [ -z "$SERVER_USER" ] || [ -z "$SSH_PRIVATE_KEY" ]; then
             echo "::error::Required secrets (SERVER_HOST, SERVER_USER, SERVER_SSH_KEY) are missing in GitHub repository settings!"
             exit 1
           fi
 
-          # 2. Настраиваем безопасный SSH-клиент
+          # 2. Проверяем целостность скачанного артефакта
+          (cd artifacts && sha256sum -c novl-server.sha256)
+
+          # 3. Настраиваем безопасный SSH-клиент
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
           echo "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_deploy
           chmod 600 ~/.ssh/id_deploy
 
-          # Сканируем хост-ключ сервера для защиты от атаки Man-in-the-Middle (MitM)
-          ssh-keyscan -p "$SERVER_PORT" -H "$SERVER_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          # Сканируем хост-ключ сервера для защиты от MitM; при недоступности — сразу честная ошибка
+          if ! ssh-keyscan -p "$SERVER_PORT" -H "$SERVER_HOST" >> ~/.ssh/known_hosts 2>/dev/null; then
+            echo "::error::ssh-keyscan failed: cannot reach $SERVER_HOST:$SERVER_PORT"
+            exit 1
+          fi
           chmod 644 ~/.ssh/known_hosts
 
-          # 3. Копируем скомпилированный бинарник во временный файл на сервере
-          chmod +x ./artifacts/novl-server
-          scp -P "$SERVER_PORT" -i ~/.ssh/id_deploy ./artifacts/novl-server "${SERVER_USER}@${SERVER_HOST}:/tmp/novl-server.new"
+          SSH_BASE=(-o BatchMode=yes -o StrictHostKeyChecking=yes -i ~/.ssh/id_deploy)
 
-          # 4. Выполняем атомарную замену и перезапуск службы
-          ssh -p "$SERVER_PORT" -i ~/.ssh/id_deploy "${SERVER_USER}@${SERVER_HOST}" << 'EOF'
+          # Уникальное имя временного файла на сервере (защита от коллизий и подмены в /tmp)
+          REMOTE_NEW="/tmp/novl-server.new.$$"
+
+          # 4. Копируем бинарник на сервер
+          chmod +x artifacts/novl-server
+          scp -P "$SERVER_PORT" "${SSH_BASE[@]}" artifacts/novl-server "${SERVER_USER}@${SERVER_HOST}:${REMOTE_NEW}"
+
+          # 5. Атомарная замена, проверка здоровья и откат при сбое
+          ssh -p "$SERVER_PORT" "${SSH_BASE[@]}" "${SERVER_USER}@${SERVER_HOST}" "REMOTE_NEW='${REMOTE_NEW}' bash -s" << 'EOF'
             set -euo pipefail
 
             echo "==> Deploying novl-server..."
-            chmod 755 /tmp/novl-server.new
+            chmod 755 "$REMOTE_NEW"
 
-            # Атомарная замена исполняемого файла через mv (предотвращает ошибку 'Text file busy')
-            if [ "$(id -u)" -eq 0 ]; then
-              mv -f /tmp/novl-server.new /usr/local/bin/novl-server
-              systemctl restart novl-server
-              sleep 2
-              systemctl is-active --quiet novl-server
-            else
-              sudo mv -f /tmp/novl-server.new /usr/local/bin/novl-server
-              sudo systemctl restart novl-server
-              sleep 2
-              sudo systemctl is-active --quiet novl-server
+            BIN=/usr/local/bin/novl-server
+            BACKUP=/usr/local/bin/novl-server.previous
+
+            SUDO=""
+            if [ "$(id -u)" -ne 0 ]; then
+              SUDO="sudo"
+            fi
+
+            # Откат к предыдущей версии при сбое
+            rollback() {
+              echo "::error::novl-server failed after deploy. Rolling back to previous version..." >&2
+              if [ -f "$BACKUP" ]; then
+                $SUDO cp -f "$BACKUP" "$BIN"
+                $SUDO systemctl restart novl-server || true
+              else
+                echo "::error::No previous version found; manual intervention required." >&2
+              fi
+              exit 1
+            }
+
+            # Бэкап текущей версии
+            if [ -f "$BIN" ]; then
+              $SUDO cp -f "$BIN" "$BACKUP"
+            fi
+
+            # Атомарная замена через mv (предотвращает ошибку 'Text file busy')
+            $SUDO mv -f "$REMOTE_NEW" "$BIN"
+            $SUDO systemctl restart novl-server
+
+            # Даём systemd время обнаружить мгновенно падающий бинарник
+            sleep 2
+            $SUDO systemctl is-active --quiet novl-server || rollback
+            PID1=$($SUDO systemctl show -p MainPID --value novl-server)
+
+            # Restart=always маскирует crash-loop: проверяем, что процесс не перезапускался
+            sleep 3
+            $SUDO systemctl is-active --quiet novl-server || rollback
+            PID2=$($SUDO systemctl show -p MainPID --value novl-server)
+
+            if [ -z "$PID2" ] || [ "$PID2" = "0" ] || [ "$PID1" != "$PID2" ]; then
+              rollback
             fi
 
             echo "==> Deployment successful: novl-server is active and running!"
