@@ -125,6 +125,37 @@ fn parse_socket_addr(val: &str) -> Option<SocketAddr> {
         .and_then(|mut addrs| addrs.next())
 }
 
+fn b64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// The wg userspace settings string carries the pre-shared key as lowercase hex
+/// (`toHex()` in the Java config layer), while the NOVL master secret is the
+/// original base64 text of the key. Normalize hex back to base64 so the client
+/// and the server derive the same master key.
+fn normalize_secret(val: &str) -> String {
+    let v = val.trim();
+    if v.len() == 64 && v.bytes().all(|c| c.is_ascii_hexdigit()) {
+        if let Ok(raw) = (0..32)
+            .map(|i| u8::from_str_radix(&v[i * 2..i * 2 + 2], 16))
+            .collect::<Result<Vec<u8>, _>>()
+        {
+            return b64_encode(&raw);
+        }
+    }
+    v.to_string()
+}
+
 /// Settings as parsed from the `wgTurnOn` settings string. The endpoint and the
 /// pre-shared key are always taken from the *same* (first) peer section.
 struct ParsedSettings {
@@ -178,7 +209,7 @@ fn parse_settings(settings: &str) -> ParsedSettings {
             } else if let Some(val) = line.strip_prefix("preshared_key=") {
                 let val = val.trim();
                 if cur_secret.is_none() && !val.is_empty() {
-                    cur_secret = Some(val.to_string());
+                    cur_secret = Some(normalize_secret(val));
                 }
             } else if let Some(val) = line.strip_prefix("secret=") {
                 let val = val.trim();
@@ -509,6 +540,18 @@ mod tests {
         let p = parse_settings(settings);
         assert_eq!(p.endpoint.as_ref().unwrap().to_string(), "1.2.3.4:1");
         assert_eq!(p.secret.as_deref(), Some("k1"));
+    }
+
+    #[test]
+    fn normalizes_hex_psk_to_base64() {
+        // wg toWgUserspaceString() emits preshared_key as lowercase hex.
+        let hex_psk = "c6b8307a0c9d566e295d9c4e05065af3d4111676e9e81bf02d139b7be7d567e6";
+        let p = parse_settings(&format!("public_key=bbb\nendpoint=1.2.3.4:1\npreshared_key={}\n", hex_psk));
+        assert_eq!(p.secret.as_deref(), Some("xrgwegydVm4pXZxOBQZa89QRFnbp6BvwLRObe+fVZ+Y="));
+
+        // A base64 PSK must pass through unchanged.
+        let p2 = parse_settings("public_key=bbb\nendpoint=1.2.3.4:1\npreshared_key=xrgwegydVm4pXZxOBQZa89QRFnbp6BvwLRObe+fVZ+Y=\n");
+        assert_eq!(p2.secret.as_deref(), Some("xrgwegydVm4pXZxOBQZa89QRFnbp6BvwLRObe+fVZ+Y="));
     }
 
     #[test]
