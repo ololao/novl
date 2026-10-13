@@ -7,8 +7,9 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tracing::{debug, error, info};
 
 use crate::protocol::{
-    build_chameleon_client_hello, build_http_upgrade_request, chrome_124_profile,
-    derive_master_key, derive_session_keys, read_decrypted_frame, StreamCipher, CMD_CONNECT,
+    build_chameleon_client_hello_v2, build_http_upgrade_request, chrome_124_profile,
+    derive_master_key, derive_v2_session_keys, encrypt_tls_frame, generate_client_ephemeral,
+    parse_and_verify_server_hello, read_tls_frame, StreamCipher, CMD_CONNECT,
     CMD_UDP_ASSOCIATE,
 };
 use crate::socks5::{
@@ -178,7 +179,7 @@ pub async fn send_fragmented_handshake(
 /// Reads the complete TLS ServerHello + ChangeCipherSpec response so that no
 /// leftover bytes remain in the stream to be misinterpreted as an encrypted
 /// frame (N06).
-async fn read_tls_server_hello(sock: &mut TcpStream) -> Result<()> {
+async fn read_tls_server_hello(sock: &mut TcpStream) -> Result<Vec<u8>> {
     let mut header = [0u8; 5];
     tokio::time::timeout(Duration::from_secs(5), sock.read_exact(&mut header)).await??;
     if header[0] != 0x16 {
@@ -194,7 +195,11 @@ async fn read_tls_server_hello(sock: &mut TcpStream) -> Result<()> {
     // Consume the ChangeCipherSpec record (RFC 8446 middlebox compatibility).
     let mut ccs = [0u8; 6];
     tokio::time::timeout(Duration::from_secs(5), sock.read_exact(&mut ccs)).await??;
-    Ok(())
+
+    let mut hello = Vec::with_capacity(5 + rec_len);
+    hello.extend_from_slice(&header);
+    hello.extend_from_slice(&body);
+    Ok(hello)
 }
 
 /// Reads the complete HTTP upgrade response up to the end of the header block,
@@ -251,56 +256,117 @@ async fn handle_client(
     crate::protocol::configure_tcp_keepalive(&client_sock);
 
     // 3. Perform handshake based on selected transport mode with Zapret-grade Multi-Segment Desync
-    let session_id = match config.mode {
+    //
+    // v2: per-connection randomized desync profile. A fixed split position with
+    // a fixed delay across a whole client fleet is itself an active-probing
+    // signature, so each connection draws its own (possibly no) split.
+    let mut rng = rand::rngs::OsRng;
+    let split_mode: u8 = rand::Rng::gen_range(&mut rng, 0..4);
+    let split_pos = match split_mode {
+        0 => 0usize, // no split at all
+        1 => rand::Rng::gen_range(&mut rng, 1..8),
+        2 => rand::Rng::gen_range(&mut rng, 8..64),
+        _ => rand::Rng::gen_range(&mut rng, 64..256),
+    };
+    let split_delay = rand::Rng::gen_range(&mut rng, 0..=25u64);
+    let use_sni_split = rand::random::<u8>() % 2 == 0;
+
+    match config.mode {
         TransportMode::TlsChameleon => {
-            let client_hello = build_chameleon_client_hello(
+            let eph = generate_client_ephemeral();
+            let client_hello = build_chameleon_client_hello_v2(
                 &chrome_124_profile(),
                 &master_key,
                 &config.server_sni,
+                Some(&eph.epk),
             );
             let session_id = crate::protocol::extract_session_id(&client_hello)
                 .ok_or_else(|| anyhow::anyhow!("Failed to extract session id"))?;
 
-            // Zapret-grade Multi-Segment Desync:
-            // 1. Split 1: Byte 2 (splits TLS Record header [0x16, 0x03] from payload)
-            // 2. Split 2: Inside the SNI domain name (splits host across packets to break DPI TCAM match)
-            let mut split_points = vec![config.split_pos];
-            if let Some((sni_start, sni_end)) =
-                crate::protocol::locate_sni_offset(&client_hello, &config.server_sni)
-            {
-                let sni_mid = sni_start + (sni_end - sni_start) / 2;
-                if sni_mid > config.split_pos {
-                    split_points.push(sni_mid);
+            let mut split_points = Vec::new();
+            if split_pos > 0 {
+                split_points.push(split_pos);
+            }
+            if use_sni_split {
+                if let Some((sni_start, sni_end)) =
+                    crate::protocol::locate_sni_offset(&client_hello, &config.server_sni)
+                {
+                    let sni_mid = sni_start + (sni_end - sni_start) / 2;
+                    if sni_mid > split_pos {
+                        split_points.push(sni_mid);
+                    }
                 }
             }
 
-            send_desync_handshake(
-                &mut remote_sock,
-                &client_hello,
-                &split_points,
-                config.split_delay_ms,
-            )
-            .await?;
+            send_desync_handshake(&mut remote_sock, &client_hello, &split_points, split_delay)
+                .await?;
 
-            read_tls_server_hello(&mut remote_sock).await?;
-            session_id
+            // v2: verify server proof BEFORE any user data leaves the device.
+            let server_hello = read_tls_server_hello(&mut remote_sock).await?;
+            let client_epk = eph.epk;
+            let server_epk =
+                parse_and_verify_server_hello(&server_hello, &master_key, &session_id, &client_epk)
+                    .ok_or_else(|| anyhow::anyhow!("Server authentication failed"))?;
+
+            let shared = eph.diffie_hellman(&server_epk)?;
+            let keys = derive_v2_session_keys(
+                &master_key,
+                &session_id,
+                &client_epk,
+                &server_epk,
+                &shared,
+            )?;
+            let encryptor = StreamCipher::new(&keys.client_enc_key);
+            let decryptor = StreamCipher::new(&keys.server_enc_key);
+            return run_authenticated_session(
+                client_sock,
+                remote_sock,
+                cmd,
+                config,
+                encryptor,
+                decryptor,
+            )
+            .await;
         }
         TransportMode::HttpUpgrade => {
             let (req, session_id) =
                 build_http_upgrade_request(&config.http_path, &config.server_sni, &master_key);
-            let split_points = vec![config.split_pos, 25];
-            send_desync_handshake(&mut remote_sock, &req, &split_points, config.split_delay_ms)
-                .await?;
+            let mut split_points = Vec::new();
+            if split_pos > 0 {
+                split_points.push(split_pos);
+            }
+            if use_sni_split {
+                split_points.push(25);
+            }
+            send_desync_handshake(&mut remote_sock, &req, &split_points, split_delay).await?;
 
             read_http_upgrade_response(&mut remote_sock).await?;
-            session_id
-        }
-    };
 
-    // 4. Initialize session ciphers
-    let keys = derive_session_keys(&master_key, &session_id);
-    let mut encryptor = StreamCipher::new(&keys.client_enc_key);
-    let mut decryptor = StreamCipher::new(&keys.server_enc_key);
+            // v1 path for HTTP mode: legacy session (no ECDH yet).
+            let keys = crate::protocol::derive_session_keys(&master_key, &session_id);
+            let encryptor = StreamCipher::new(&keys.client_enc_key);
+            let decryptor = StreamCipher::new(&keys.server_enc_key);
+            return run_authenticated_session(
+                client_sock,
+                remote_sock,
+                cmd,
+                config,
+                encryptor,
+                decryptor,
+            )
+            .await;
+        }
+    }
+}
+
+async fn run_authenticated_session(
+    mut client_sock: TcpStream,
+    mut remote_sock: TcpStream,
+    cmd: SocksCommand,
+    _config: Arc<ClientConfig>,
+    mut encryptor: StreamCipher,
+    mut decryptor: StreamCipher,
+) -> Result<()> {
 
     match cmd {
         SocksCommand::UdpAssociate(_) => {
@@ -309,12 +375,12 @@ async fn handle_client(
             let local_udp_addr = local_udp.local_addr()?;
 
             // Send UDP Associate command frame to remote server
-            let initial_frame = encryptor.encrypt_frame(&[CMD_UDP_ASSOCIATE], 16)?;
+            let initial_frame = encrypt_tls_frame(&mut encryptor, &[CMD_UDP_ASSOCIATE], Some(16))?;
             remote_sock.write_all(&initial_frame).await?;
             remote_sock.flush().await?;
 
             // Read confirmation from server
-            let status_frame = read_decrypted_frame(&mut remote_sock, &mut decryptor).await?;
+            let status_frame = read_tls_frame(&mut remote_sock, &mut decryptor).await?;
             if status_frame.is_empty() || status_frame[0] != 0x00 {
                 bail!("Remote server rejected UDP associate request");
             }
@@ -379,7 +445,7 @@ async fn handle_client(
                     } else {
                         0
                     };
-                    match encryptor.encrypt_frame(&pkt, pad) {
+                    match encrypt_tls_frame(&mut encryptor, &pkt, Some(pad)) {
                         Ok(frame) => {
                             if let Err(e) = remote_tx.write_all(&frame).await {
                                 debug!("Write to remote UDP stream failed: {}", e);
@@ -397,7 +463,7 @@ async fn handle_client(
             let session_map_rx = Arc::clone(&session_map);
             let last_peer_rx = Arc::clone(&last_peer_holder);
             let t2u = async move {
-                while let Ok(frame) = read_decrypted_frame(&mut remote_rx, &mut decryptor).await {
+                while let Ok(frame) = read_tls_frame(&mut remote_rx, &mut decryptor).await {
                     if frame.is_empty() {
                         break;
                     }
@@ -434,12 +500,12 @@ async fn handle_client(
             payload.push(CMD_CONNECT);
             payload.extend_from_slice(&target.to_bytes());
 
-            let initial_frame = encryptor.encrypt_frame(&payload, 16)?;
+            let initial_frame = encrypt_tls_frame(&mut encryptor, &payload, Some(16))?;
             remote_sock.write_all(&initial_frame).await?;
             remote_sock.flush().await?;
 
             // Read confirmation frame from server
-            let status_frame = read_decrypted_frame(&mut remote_sock, &mut decryptor).await?;
+            let status_frame = read_tls_frame(&mut remote_sock, &mut decryptor).await?;
             if status_frame.is_empty() || status_frame[0] != 0x00 {
                 bail!("Remote server rejected target connection");
             }
@@ -465,7 +531,7 @@ async fn handle_client(
                                 } else {
                                     0
                                 };
-                                match encryptor.encrypt_frame(chunk, pad) {
+                                match encrypt_tls_frame(&mut encryptor, chunk, Some(pad)) {
                                     Ok(frame) => {
                                         if let Err(e) = remote_tx.write_all(&frame).await {
                                             debug!("Write to remote failed: {}", e);
@@ -487,7 +553,7 @@ async fn handle_client(
 
             // Pipe 2: Remote Server (Encrypted) -> Local App (Plaintext)
             let r2c = async move {
-                while let Ok(data) = read_decrypted_frame(&mut remote_rx, &mut decryptor).await {
+                while let Ok(data) = read_tls_frame(&mut remote_rx, &mut decryptor).await {
                     if data.is_empty() {
                         break;
                     }

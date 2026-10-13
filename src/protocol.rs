@@ -19,9 +19,102 @@ pub const HEADER_LEN: usize = 4 + TAG_LEN;
 pub const CMD_CONNECT: u8 = 0x11;
 pub const CMD_UDP_ASSOCIATE: u8 = 0x12;
 
+// =============== Protocol v2: ECDH + server auth ===============
+
+/// Protocol version carried inside the auth token MAC binding. The version byte
+/// is hashed together with the transcript so a downgrade attempt (v2 client
+/// hello replayed as v1) fails MAC verification without any explicit
+/// negotiation round-trip.
+pub const PROTOCOL_VERSION_V1: u8 = 1;
+pub const PROTOCOL_VERSION_V2: u8 = 2;
+
+pub const EPH_PUB_LEN: usize = 32;
+
 pub struct CryptoKeys {
     pub client_enc_key: [u8; 32],
     pub server_enc_key: [u8; 32],
+}
+
+/// Ephemeral X25519 keypair generated per connection by the client.
+pub struct ClientEphemeral {
+    esk: x25519_dalek::EphemeralSecret,
+    pub epk: [u8; 32],
+}
+
+pub fn generate_client_ephemeral() -> ClientEphemeral {
+    let esk = x25519_dalek::EphemeralSecret::random_from_rng(rand::rngs::OsRng);
+    let epk: [u8; 32] = x25519_dalek::PublicKey::from(&esk).to_bytes();
+    ClientEphemeral { esk, epk }
+}
+
+impl ClientEphemeral {
+    /// ECDH shared secret with the server's ephemeral public key.
+    /// Consumes the ephemeral secret (single-use by design).
+    pub fn diffie_hellman(self, server_epk: &[u8; 32]) -> Result<[u8; 32]> {
+        let pk = x25519_dalek::PublicKey::from(*server_epk);
+        let shared = self.esk.diffie_hellman(&pk);
+        if !shared.was_contributory() {
+            bail!("X25519 shared secret is not contributory (peer key rejected)");
+        }
+        Ok(shared.to_bytes())
+    }
+}
+
+/// Computes the shared secret and derives the v2 transport keys.
+/// Both peers must end up with identical keys or the session is torn down.
+pub fn derive_v2_session_keys(
+    master_key: &[u8; 32],
+    session_id: &[u8; 32],
+    client_epk: &[u8; 32],
+    server_epk: &[u8; 32],
+    shared: &[u8; 32],
+) -> Result<CryptoKeys> {
+    let zero = [0u8; 32];
+    if *shared == zero {
+        bail!("X25519 all-zero shared secret (peer key rejected)");
+    }
+
+    let mut kdf = blake3::Hasher::new_derive_key("NOVL-v2-SESSION-KEYS");
+    kdf.update(master_key);
+    kdf.update(session_id);
+    kdf.update(client_epk);
+    kdf.update(server_epk);
+    kdf.update(shared);
+    let okm = *kdf.finalize().as_bytes();
+
+    let mut c2s = blake3::Hasher::new_derive_key("NOVL-v2-C2S-SESSION-KEY");
+    c2s.update(&okm);
+    let client_enc_key = *c2s.finalize().as_bytes();
+
+    let mut s2c = blake3::Hasher::new_derive_key("NOVL-v2-S2C-SESSION-KEY");
+    s2c.update(&okm);
+    let server_enc_key = *s2c.finalize().as_bytes();
+
+    Ok(CryptoKeys {
+        client_enc_key,
+        server_enc_key,
+    })
+}
+
+/// Server proof carried in the ServerHello random: first 16 bytes are a keyed
+/// hash over the transcript, bound to a secret only the real server (PSK
+/// holder) can compute. The client verifies it BEFORE sending any user data,
+/// closing MitM and reflection vectors.
+pub fn compute_server_proof(
+    master_key: &[u8; 32],
+    session_id: &[u8; 32],
+    client_epk: &[u8; 32],
+    server_epk: &[u8; 32],
+) -> [u8; 16] {
+    let mut kdf = blake3::Hasher::new_derive_key("NOVL-v2-PROOF");
+    kdf.update(master_key);
+    kdf.update(session_id);
+    kdf.update(client_epk);
+    kdf.update(server_epk);
+    let okm = kdf.finalize();
+    let mut proof = [0u8; 16];
+    proof.copy_from_slice(&okm.as_bytes()[0..16]);
+    proof
 }
 
 // =============== Dynamic TLS Fingerprint Profile ===============
@@ -178,6 +271,29 @@ pub fn derive_master_key(secret: &str) -> [u8; 32] {
 }
 
 pub fn generate_auth_session_id(master_key: &[u8; 32]) -> [u8; 32] {
+    generate_auth_session_id_v2(master_key, None)
+}
+
+/// v1 token: MAC over (timestamp || salt) only. Used by 0.1.x peers.
+pub fn generate_auth_session_id_v1(master_key: &[u8; 32]) -> [u8; 32] {
+    let (data, _) = token_data();
+    let mac = token_mac_v1(master_key, &data);
+    assemble_token(&data, &mac)
+}
+
+/// v2 token: MAC over (version || timestamp || salt || optional client
+/// ephemeral public key). Binding the ephemeral key into the token MAC makes a
+/// downgraded/replayed hello fail verification before any cipher is engaged.
+pub fn generate_auth_session_id_v2(
+    master_key: &[u8; 32],
+    client_epk: Option<&[u8; 32]>,
+) -> [u8; 32] {
+    let (data, version) = token_data();
+    let mac = token_mac_v2(master_key, &data, version, client_epk);
+    assemble_token(&data, &mac)
+}
+
+fn token_data() -> ([u8; 16], u8) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -189,15 +305,48 @@ pub fn generate_auth_session_id(master_key: &[u8; 32]) -> [u8; 32] {
     let mut data = [0u8; 16];
     BigEndian::write_u64(&mut data[0..8], now);
     data[8..16].copy_from_slice(&salt);
+    (data, PROTOCOL_VERSION_V2)
+}
 
+fn token_mac_v1(master_key: &[u8; 32], data: &[u8; 16]) -> [u8; 16] {
     let mut keyed_hasher = blake3::Hasher::new_keyed(master_key);
-    keyed_hasher.update(&data);
+    keyed_hasher.update(data);
     let mac = keyed_hasher.finalize();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&mac.as_bytes()[0..16]);
+    out
+}
 
+fn token_mac_v2(
+    master_key: &[u8; 32],
+    data: &[u8; 16],
+    version: u8,
+    client_epk: Option<&[u8; 32]>,
+) -> [u8; 16] {
+    let mut keyed_hasher = blake3::Hasher::new_keyed(master_key);
+    keyed_hasher.update(&[version]);
+    keyed_hasher.update(data);
+    if let Some(epk) = client_epk {
+        keyed_hasher.update(epk);
+    }
+    let mac = keyed_hasher.finalize();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&mac.as_bytes()[0..16]);
+    out
+}
+
+fn assemble_token(data: &[u8; 16], mac: &[u8; 16]) -> [u8; 32] {
     let mut session_id = [0u8; 32];
-    session_id[0..16].copy_from_slice(&data);
-    session_id[16..32].copy_from_slice(&mac.as_bytes()[0..16]);
+    session_id[0..16].copy_from_slice(data);
+    session_id[16..32].copy_from_slice(mac);
     session_id
+}
+
+/// Outcome of token verification: which protocol version the peer speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthVersion {
+    V1,
+    V2,
 }
 
 pub fn verify_auth_session_id(
@@ -205,6 +354,19 @@ pub fn verify_auth_session_id(
     session_id: &[u8; 32],
     replay_filter: &ReplayFilter,
 ) -> bool {
+    verify_auth_session_id_versioned(master_key, session_id, replay_filter, None).is_some()
+}
+
+/// Verifies the token trying v2 first (with the extracted key share as
+/// binding), then v1, and reports the negotiated version. Returns `None` when
+/// neither version verifies (wrong PSK, stale token, tampered hello) — the
+/// caller treats this as unauthenticated traffic.
+pub fn verify_auth_session_id_versioned(
+    master_key: &[u8; 32],
+    session_id: &[u8; 32],
+    replay_filter: &ReplayFilter,
+    client_epk: Option<&[u8; 32]>,
+) -> Option<AuthVersion> {
     let ts = BigEndian::read_u64(&session_id[0..8]);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -213,23 +375,41 @@ pub fn verify_auth_session_id(
 
     // Check sliding window of +/- 90 seconds
     if ts.abs_diff(now) > 90 {
-        return false;
+        return None;
     }
 
-    let mut keyed_hasher = blake3::Hasher::new_keyed(master_key);
-    keyed_hasher.update(&session_id[0..16]);
-    let mac = keyed_hasher.finalize();
-
-    // Constant-time comparison
-    let expected = &mac.as_bytes()[0..16];
+    let mut data = [0u8; 16];
+    data.copy_from_slice(&session_id[0..16]);
     let actual = &session_id[16..32];
-    if !subtle_eq(expected, actual) {
-        return false;
+
+    // v2: MAC(version || data || client_epk?) — always attempted; the MAC
+    // includes the epk when one is supplied, so a bound token verifies only
+    // against its own hello.
+    let v2_mac = token_mac_v2(master_key, &data, PROTOCOL_VERSION_V2, client_epk);
+    if subtle_eq(&v2_mac, actual) {
+        if replay_check(replay_filter, &data) {
+            return Some(AuthVersion::V2);
+        }
+        return None;
     }
 
-    // Check against replay filter
+    // v1: MAC(data) — legacy 0.1.x clients always carry a key_share-looking
+    // extension with random bytes, so their hello arrives with a non-None
+    // client_epk too. A v1 token never carries an epk binding: the MAC is
+    // computed without it. Verifying the bare v1 MAC here is safe — a v2-bound
+    // token can never match it, and an attacker replaying a captured v1 token
+    // is still stopped by the replay filter.
+    let v1_mac = token_mac_v1(master_key, &data);
+    if subtle_eq(&v1_mac, actual) && replay_check(replay_filter, &data) {
+        return Some(AuthVersion::V1);
+    }
+
+    None
+}
+
+fn replay_check(replay_filter: &ReplayFilter, data: &[u8; 16]) -> bool {
     let mut token = [0u8; 16];
-    token.copy_from_slice(&session_id[0..16]);
+    token.copy_from_slice(data);
     replay_filter.check_and_record(&token)
 }
 
@@ -274,7 +454,23 @@ pub fn build_chameleon_client_hello(
     master_key: &[u8; 32],
     sni: &str,
 ) -> Vec<u8> {
-    let session_id = generate_auth_session_id(master_key);
+    build_chameleon_client_hello_v2(profile, master_key, sni, None)
+}
+
+/// v2 hello: the auth token MAC binds the client ephemeral X25519 public key
+/// and the key_share extension carries that real key instead of random bytes,
+/// enabling ECDH-based PFS and server authentication while staying
+/// byte-compatible with a genuine Chrome ClientHello.
+pub fn build_chameleon_client_hello_v2(
+    profile: &TlsFingerprintProfile,
+    master_key: &[u8; 32],
+    sni: &str,
+    client_epk: Option<&[u8; 32]>,
+) -> Vec<u8> {
+    let session_id = match client_epk {
+        Some(epk) => generate_auth_session_id_v2(master_key, Some(epk)),
+        None => generate_auth_session_id_v1(master_key),
+    };
     let mut rng = rand::thread_rng();
 
     let grease_cipher = GREASE_VALUES[rng.gen_range(0..16)];
@@ -410,20 +606,38 @@ pub fn build_chameleon_client_hello(
         extensions.extend_from_slice(&0x0000u16.to_be_bytes());
     }
 
-    // 11. Key Share (0x0033) - GREASE + x25519 (profile groups influence possible future KEM)
+    // 11. Key Share (0x0033) - GREASE + x25519. In v2 this carries the real
+    // ephemeral X25519 public key used for the session ECDH; externally it is
+    // indistinguishable from a genuine Chrome key share.
     let mut client_key_share = [0u8; 32];
-    rng.fill_bytes(&mut client_key_share);
-    let mut ks_data = Vec::new();
-    ks_data.extend_from_slice(&grease_group.to_be_bytes());
-    ks_data.extend_from_slice(&1u16.to_be_bytes());
-    ks_data.push(0x00);
-    ks_data.extend_from_slice(&0x001du16.to_be_bytes());
-    ks_data.extend_from_slice(&32u16.to_be_bytes());
-    ks_data.extend_from_slice(&client_key_share);
+    match client_epk {
+        Some(epk) => client_key_share.copy_from_slice(epk),
+        None => rng.fill_bytes(&mut client_key_share),
+    }
+    // Genuine Chrome emits a GREASE entry shaped exactly like a real key share
+    // entry: [grease_group u16][41 u16][43 random bytes]. Anything shorter is a
+    // parser-visible anomaly.
+    let mut grease_entry = Vec::with_capacity(4 + 41);
+    grease_entry.extend_from_slice(&grease_group.to_be_bytes());
+    grease_entry.extend_from_slice(&41u16.to_be_bytes());
+    let mut grease_key = [0u8; 41];
+    rng.fill_bytes(&mut grease_key);
+    grease_entry.extend_from_slice(&grease_key);
 
-    let mut ks_ext = Vec::new();
-    ks_ext.extend_from_slice(&(ks_data.len() as u16).to_be_bytes());
-    ks_ext.extend_from_slice(&ks_data);
+    let mut x25519_entry = Vec::with_capacity(4 + 32);
+    x25519_entry.extend_from_slice(&0x001du16.to_be_bytes());
+    x25519_entry.extend_from_slice(&32u16.to_be_bytes());
+    x25519_entry.extend_from_slice(&client_key_share);
+
+    let mut shares = Vec::with_capacity(grease_entry.len() + x25519_entry.len());
+    shares.extend_from_slice(&grease_entry);
+    shares.extend_from_slice(&x25519_entry);
+
+    // ext data = [client_shares_len u16][entries...] — single length wrapper,
+    // matching a genuine Chrome key_share extension.
+    let mut ks_ext = Vec::with_capacity(2 + shares.len());
+    ks_ext.extend_from_slice(&(shares.len() as u16).to_be_bytes());
+    ks_ext.extend_from_slice(&shares);
     extensions.extend_from_slice(&0x0033u16.to_be_bytes());
     extensions.extend_from_slice(&(ks_ext.len() as u16).to_be_bytes());
     extensions.extend_from_slice(&ks_ext);
@@ -517,6 +731,141 @@ pub fn locate_sni_offset(client_hello: &[u8], sni: &str) -> Option<(usize, usize
         .map(|idx| (idx, idx + sni_bytes.len()))
 }
 
+/// Parses the 32-byte X25519 key share out of an incoming TLS ClientHello by
+/// walking the extension list (robust against variable padding/SNI lengths).
+pub fn extract_client_key_share(buf: &[u8]) -> Option<[u8; 32]> {
+    if buf.len() < 43 || buf[0] != 0x16 || buf[5] != 0x01 {
+        return None;
+    }
+    let hs_len = BigEndian::read_u24(&buf[6..9]) as usize;
+    let end = (9 + hs_len).min(buf.len());
+    let mut pos = 9 + 2 + 32; // version + random
+    if pos >= end {
+        return None;
+    }
+    let sid_len = buf[pos] as usize;
+    pos += 1 + sid_len; // session id
+    if pos + 2 > end {
+        return None;
+    }
+    let cs_len = BigEndian::read_u16(&buf[pos..pos + 2]) as usize;
+    pos += 2 + cs_len; // cipher suites vector
+    if pos + 1 >= end {
+        return None;
+    }
+    pos += 1 + buf[pos] as usize; // compression methods
+    if pos + 2 > end {
+        return None;
+    }
+    let ext_total = BigEndian::read_u16(&buf[pos..pos + 2]) as usize;
+    pos += 2;
+    let ext_end = (pos + ext_total).min(end);
+
+    while pos + 4 <= ext_end {
+        let etype = BigEndian::read_u16(&buf[pos..pos + 2]);
+        let elen = BigEndian::read_u16(&buf[pos + 2..pos + 4]) as usize;
+        let edata = pos + 4;
+        if edata + elen > ext_end {
+            return None;
+        }
+        if etype == 0x0033 && elen >= 2 {
+            // client_share list: [list_len u16][entry: group u16][klen u16][key..];
+            // the first entry may be GREASE, so walk until x25519(0x001d).
+            let list_len = BigEndian::read_u16(&buf[edata..edata + 2]) as usize;
+            let list_end = (edata + 2 + list_len).min(edata + elen);
+            let mut off = edata + 2;
+            while off + 4 <= list_end {
+                let group = BigEndian::read_u16(&buf[off..off + 2]);
+                let klen = BigEndian::read_u16(&buf[off + 2..off + 4]) as usize;
+                if group == 0x001d && klen == 32 && off + 4 + 32 <= list_end {
+                    let mut out = [0u8; 32];
+                    out.copy_from_slice(&buf[off + 4..off + 4 + 32]);
+                    return Some(out);
+                }
+                off += 4 + klen;
+            }
+            return None;
+        }
+        pos = edata + elen;
+    }
+    None
+}
+
+fn read_u24(b: &[u8]) -> u32 {
+    ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32)
+}
+
+/// Parses a chameleon ServerHello and verifies the v2 server proof against the
+/// transcript. Returns the server ephemeral X25519 public key on success.
+pub fn parse_and_verify_server_hello(
+    buf: &[u8],
+    master_key: &[u8; 32],
+    session_id: &[u8; 32],
+    client_epk: &[u8; 32],
+) -> Option<[u8; 32]> {
+    // Record header (5) + handshake header (4) + version (2) + random (32)
+    if buf.len() < 5 + 4 + 2 + 32 + 1 + 2 + 2 || buf[0] != 0x16 || buf[5] != 0x02 {
+        return None;
+    }
+    let random = &buf[5 + 4 + 2..5 + 4 + 2 + 32];
+    let proof = &random[0..16];
+    let server_epk = extract_server_key_share(buf)?;
+
+    let expected = compute_server_proof(master_key, session_id, client_epk, &server_epk);
+    if !subtle_eq(proof, &expected) {
+        return None;
+    }
+    Some(server_epk)
+}
+
+/// Extracts the x25519 key share from a ServerHello by walking its extensions.
+pub fn extract_server_key_share(buf: &[u8]) -> Option<[u8; 32]> {
+    if buf.len() < 5 + 4 + 2 + 32 + 1 + 2 + 2 || buf[0] != 0x16 || buf[5] != 0x02 {
+        return None;
+    }
+    let hs_len = read_u24(&buf[6..9]) as usize;
+    let end = (9 + hs_len).min(buf.len());
+    let mut pos = 9 + 2 + 32; // version + random
+    if pos >= end {
+        return None;
+    }
+    let sid_len = buf[pos] as usize;
+    pos += 1 + sid_len; // session id
+    pos += 2; // cipher suites
+    if pos + 1 >= end {
+        return None;
+    }
+    pos += 1 + buf[pos] as usize; // compression
+    if pos + 2 > end {
+        return None;
+    }
+    let ext_total = BigEndian::read_u16(&buf[pos..pos + 2]) as usize;
+    pos += 2;
+    let ext_end = (pos + ext_total).min(end);
+
+    while pos + 4 <= ext_end {
+        let etype = BigEndian::read_u16(&buf[pos..pos + 2]);
+        let elen = BigEndian::read_u16(&buf[pos + 2..pos + 4]) as usize;
+        let edata = pos + 4;
+        if edata + elen > ext_end {
+            return None;
+        }
+        if etype == 0x0033 && elen >= 36 {
+            // server_share: group(2) + len(2) + key(32)
+            let group = BigEndian::read_u16(&buf[edata..edata + 2]);
+            let klen = BigEndian::read_u16(&buf[edata + 2..edata + 4]) as usize;
+            if group == 0x001d && klen == 32 && elen >= 4 + klen {
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&buf[edata + 4..edata + 4 + 32]);
+                return Some(out);
+            }
+            return None;
+        }
+        pos = edata + elen;
+    }
+    None
+}
+
 /// Parses the 32-byte Session ID out of an incoming TLS ClientHello
 pub fn extract_session_id(buf: &[u8]) -> Option<[u8; 32]> {
     if buf.len() < 5 + 4 + 2 + 32 + 1 + 32 {
@@ -546,8 +895,28 @@ pub fn extract_session_id(buf: &[u8]) -> Option<[u8; 32]> {
 /// Disguised ServerHello response with realistic TLS 1.3 KeyShare and Middlebox CCS
 pub fn build_chameleon_server_hello() -> Vec<u8> {
     let mut rng = rand::thread_rng();
+    let mut epk = [0u8; 32];
+    rng.fill_bytes(&mut epk);
+    build_chameleon_server_hello_v2(None, None, None, &epk)
+}
+
+/// v2 ServerHello: the random field carries [proof(16) || server_ephemeral(16..48)]
+/// where proof is a keyed hash over the transcript — the client verifies it
+/// before sending data. Falls back to pure randomness for v1 sessions.
+pub fn build_chameleon_server_hello_v2(
+    master_key: Option<&[u8; 32]>,
+    session_id: Option<&[u8; 32]>,
+    client_epk: Option<&[u8; 32]>,
+    server_epk: &[u8; 32],
+) -> Vec<u8> {
+    let mut rng = rand::thread_rng();
     let mut server_random = [0u8; 32];
     rng.fill_bytes(&mut server_random);
+
+    if let (Some(mk), Some(sid), Some(cepks)) = (master_key, session_id, client_epk) {
+        let proof = compute_server_proof(mk, sid, cepks, server_epk);
+        server_random[0..16].copy_from_slice(&proof);
+    }
 
     // Handshake body
     let mut body = Vec::new();
@@ -565,9 +934,8 @@ pub fn build_chameleon_server_hello() -> Vec<u8> {
     extensions.extend_from_slice(&(sup_versions.len() as u16).to_be_bytes());
     extensions.extend_from_slice(&sup_versions);
 
-    // Key Share ext (x25519)
-    let mut server_key_share = [0u8; 32];
-    rng.fill_bytes(&mut server_key_share);
+    // Key Share ext (x25519) — real ephemeral public key (v2) or random (v1)
+    let server_key_share: [u8; 32] = *server_epk;
     let mut ks_ext = Vec::new();
     ks_ext.extend_from_slice(&0x001du16.to_be_bytes()); // x25519
     ks_ext.extend_from_slice(&32u16.to_be_bytes());
@@ -709,6 +1077,77 @@ impl StreamCipher {
         data.truncate(payload_len as usize);
         Ok(data)
     }
+}
+
+// =============== v2 TLS-record wire codec ===============
+//
+// v1 frames are [len u16][pad u16][ct] — an instantly recognizable
+// "fully encrypted" signature after the hello. v2 wraps each frame into a
+// realistic TLS application-data record (0x17 0x03 0x03, length <= 16KB) and
+// pads the payload to a 64-byte multiple so wire sizes leak less about the
+// inner traffic (DNS packets etc.).
+
+pub const TLS_REC_HEADER_LEN: usize = 5;
+pub const TLS_REC_MAX: usize = 16384 + 256; // max record we may emit
+pub const PAD_TO_MULTIPLE: usize = 64;
+
+/// Encrypts a payload and wraps it into a TLS application-data record.
+/// v2 header: [0x17,0x03,0x03][len u16][inner_len u16][pad u16][ct...]
+pub fn encrypt_tls_frame(
+    encryptor: &mut StreamCipher,
+    payload: &[u8],
+    force_pad: Option<u16>,
+) -> Result<Vec<u8>> {
+    if payload.len() > MAX_PAYLOAD_SIZE {
+        bail!("Payload exceeds maximum allowed frame size");
+    }
+    // Pad to 64-byte multiple (plus random extra up to 192) unless forced.
+    let pad = match force_pad {
+        Some(p) => p.min(MAX_PADDING_SIZE),
+        None => {
+            let padded_len = payload.len().div_ceil(PAD_TO_MULTIPLE) * PAD_TO_MULTIPLE;
+            let base = padded_len - payload.len();
+            let extra = rand::thread_rng().gen_range(0..4) * PAD_TO_MULTIPLE;
+            (base + extra) as u16
+        }
+    };
+
+    let frame = encryptor.encrypt_frame(payload, pad)?;
+    // frame = [inner_len u16][pad u16][ct]
+    let mut rec = Vec::with_capacity(TLS_REC_HEADER_LEN + frame.len());
+    rec.extend_from_slice(&[0x17, 0x03, 0x03]);
+    rec.extend_from_slice(&(frame.len() as u16).to_be_bytes());
+    rec.extend_from_slice(&frame);
+    Ok(rec)
+}
+
+/// Reads one TLS record, validates the v2 header, decrypts the inner frame.
+pub async fn read_tls_frame<R: tokio::io::AsyncReadExt + Unpin>(
+    reader: &mut R,
+    decryptor: &mut StreamCipher,
+) -> Result<Vec<u8>> {
+    let mut header = [0u8; TLS_REC_HEADER_LEN];
+    reader.read_exact(&mut header).await?;
+    if header[0] != 0x17 || header[1] != 0x03 || header[2] != 0x03 {
+        bail!("unexpected record type in v2 stream: {:02x}", header[0]);
+    }
+    let rec_len = BigEndian::read_u16(&header[3..5]) as usize;
+    if rec_len < 4 + TAG_LEN || rec_len > TLS_REC_MAX {
+        bail!("record length out of bounds: {}", rec_len);
+    }
+    let mut rec = vec![0u8; rec_len];
+    reader.read_exact(&mut rec).await?;
+
+    let inner_len = BigEndian::read_u16(&rec[0..2]) as usize;
+    let pad_len = BigEndian::read_u16(&rec[2..4]) as usize;
+    if inner_len > MAX_PAYLOAD_SIZE || pad_len > MAX_PADDING_SIZE as usize {
+        bail!("frame length fields exceed maximum bounds");
+    }
+    decryptor.decrypt_frame(
+        inner_len as u16,
+        pad_len as u16,
+        &rec[4..],
+    )
 }
 
 /// Reads and decrypts an AEAD frame asynchronously from any AsyncRead source
@@ -1136,5 +1575,162 @@ mod tests {
 
         let res2 = read_decrypted_frame(&mut reader2, &mut dec).await;
         assert!(res2.is_err(), "Must reject oversized padding header");
+    }
+
+    // =============== v2 protocol tests ===============
+
+    #[test]
+    fn v2_ecdh_key_agreement_roundtrip() {
+        let mk = derive_master_key("e2e-secret");
+        let sid = generate_auth_session_id_v2(&mk, None);
+
+        let client = generate_client_ephemeral();
+        let client_epk = client.epk;
+        let mut server_esk_bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut server_esk_bytes);
+        let server_esk = x25519_dalek::StaticSecret::from(server_esk_bytes);
+        let server_epk = x25519_dalek::PublicKey::from(&server_esk).to_bytes();
+
+        let shared_c = client.diffie_hellman(&server_epk).unwrap();
+        let shared_s = server_esk
+            .diffie_hellman(&x25519_dalek::PublicKey::from(client_epk))
+            .to_bytes();
+
+        let kc =
+            derive_v2_session_keys(&mk, &sid, &client_epk, &server_epk, &shared_c).unwrap();
+        let ks = derive_v2_session_keys(&mk, &sid, &client_epk, &server_epk, &shared_s).unwrap();
+        assert_eq!(kc.client_enc_key, ks.client_enc_key);
+        assert_eq!(kc.server_enc_key, ks.server_enc_key);
+    }
+
+    #[test]
+    fn v2_server_proof_verifies_and_rejects() {
+        let mk = derive_master_key("proof-secret");
+        let sid = generate_auth_session_id_v2(&mk, None);
+        let client = generate_client_ephemeral();
+        let mut server_epk = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut server_epk);
+
+        let hello = build_chameleon_server_hello_v2(Some(&mk), Some(&sid), Some(&client.epk), &server_epk);
+        let parsed = parse_and_verify_server_hello(&hello, &mk, &sid, &client.epk);
+        assert_eq!(parsed, Some(server_epk));
+
+        // Wrong client key (MitM substitution) must fail.
+        let other = generate_client_ephemeral();
+        assert_eq!(parse_and_verify_server_hello(&hello, &mk, &sid, &other.epk), None);
+
+        // Plain v1 hello (random proof) must fail.
+        let v1_hello = build_chameleon_server_hello();
+        assert_eq!(parse_and_verify_server_hello(&v1_hello, &mk, &sid, &client.epk), None);
+    }
+
+    #[test]
+    fn v2_token_rejects_downgrade_and_v1_backcompat() {
+        let mk = derive_master_key("downgrade-secret");
+        let filter = ReplayFilter::new(120);
+
+        // v2 token with epk binding: verifying without epk must fail on both versions.
+        let client = generate_client_ephemeral();
+        let sid = generate_auth_session_id_v2(&mk, Some(&client.epk));
+        assert_eq!(verify_auth_session_id_versioned(&mk, &sid, &filter, None), None);
+        assert_eq!(
+            verify_auth_session_id_versioned(&mk, &sid, &filter, Some(&client.epk)),
+            Some(AuthVersion::V2)
+        );
+
+        // v1 token still verifies as v1 (server accepts old 0.1.x clients).
+        let sid_v1 = generate_auth_session_id_v1(&mk);
+        assert_eq!(
+            verify_auth_session_id_versioned(&mk, &sid_v1, &filter, None),
+            Some(AuthVersion::V1)
+        );
+        // A v1 token verifies even when a key share was extracted (legacy
+        // clients always carry one); it still cannot impersonate v2.
+        // Fresh filter: tokens are single-use by design.
+        let filter2 = ReplayFilter::new(120);
+        assert_eq!(
+            verify_auth_session_id_versioned(&mk, &sid_v1, &filter2, Some(&client.epk)),
+            Some(AuthVersion::V1)
+        );
+        let filter3 = ReplayFilter::new(120);
+        assert_ne!(
+            verify_auth_session_id_versioned(&mk, &sid, &filter3, Some(&client.epk)),
+            Some(AuthVersion::V1)
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_bidirectional_streams_independent_nonces() {
+        // c2s and s2c directions use different keys; interleaved frames must
+        // decrypt with the matching per-direction cipher only.
+        let keys = CryptoKeys {
+            client_enc_key: derive_master_key("c2s-key"),
+            server_enc_key: derive_master_key("s2c-key"),
+        };
+        let mut c_enc = StreamCipher::new(&keys.client_enc_key);
+        let mut s_dec = StreamCipher::new(&keys.client_enc_key);
+        let mut s_enc = StreamCipher::new(&keys.server_enc_key);
+        let mut c_dec = StreamCipher::new(&keys.server_enc_key);
+
+        let up = b"client->server payload";
+        let down = b"server->client response";
+        let mut up_wire = encrypt_tls_frame(&mut c_enc, up, None).unwrap();
+        let down_wire = encrypt_tls_frame(&mut s_enc, down, None).unwrap();
+        up_wire.extend_from_slice(&down_wire);
+
+        let mut cur = std::io::Cursor::new(up_wire);
+        let got_up = read_tls_frame(&mut cur, &mut s_dec).await.unwrap();
+        let got_down = read_tls_frame(&mut cur, &mut c_dec).await.unwrap();
+        assert_eq!(got_up, up);
+        assert_eq!(got_down, down);
+    }
+
+    #[tokio::test]
+    async fn v2_tls_frame_roundtrip_and_padding() {
+        let keys = CryptoKeys {
+            client_enc_key: derive_master_key("frame-k1"),
+            server_enc_key: derive_master_key("frame-k2"),
+        };
+        let mut enc = StreamCipher::new(&keys.client_enc_key);
+        // Same-direction frames share the same key on both peers (client->server).
+        let mut dec = StreamCipher::new(&keys.client_enc_key);
+
+        let payload: Vec<u8> = (0..1000).map(|i| (i % 251) as u8).collect();
+        let wire = encrypt_tls_frame(&mut enc, &payload, None).unwrap();
+
+        // TLS application-data record header
+        assert_eq!(&wire[0..3], &[0x17, 0x03, 0x03]);
+        let rec_len = u16::from_be_bytes([wire[3], wire[4]]) as usize;
+        assert_eq!(wire.len(), 5 + rec_len);
+
+        // (1000 bytes + pad) + 4 header + 16 tag must be padded to 64-multiple
+        let ct_len = rec_len - 4;
+        let raw_len = ct_len - 16; // payload + pad
+        assert_eq!(raw_len % 64, 0, "payload+padding must be 64-aligned");
+
+        let mut cursor = std::io::Cursor::new(wire);
+        let decrypted = read_tls_frame(&mut cursor, &mut dec).await.unwrap();
+        assert_eq!(decrypted, payload);
+    }
+
+    #[test]
+    fn v2_client_hello_carries_real_key_share() {
+        let mk = derive_master_key("hello-secret");
+        let client = generate_client_ephemeral();
+        let hello = build_chameleon_client_hello_v2(
+            &chrome_124_profile(),
+            &mk,
+            "example.com",
+            Some(&client.epk),
+        );
+        assert_eq!(extract_client_key_share(&hello), Some(client.epk));
+
+        // Token must bind this epk: verification with the same epk succeeds.
+        let sid = extract_session_id(&hello).unwrap();
+        let filter = ReplayFilter::new(120);
+        assert_eq!(
+            verify_auth_session_id_versioned(&mk, &sid, &filter, Some(&client.epk)),
+            Some(AuthVersion::V2)
+        );
     }
 }

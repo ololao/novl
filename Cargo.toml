@@ -23,6 +23,7 @@ tun2proxy = { version = "0.8.4", default-features = false }
 jni-sys = "0.4"
 log = "0.4"
 socket2 = "0.5"
+x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.15"

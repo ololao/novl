@@ -1,15 +1,19 @@
 use anyhow::{bail, Result};
 use byteorder::{BigEndian, ByteOrder};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tracing::{debug, error, info, warn};
 
 use crate::protocol::{
-    build_chameleon_server_hello, derive_master_key, derive_session_keys, extract_http_auth,
-    extract_session_id, read_decrypted_frame, verify_auth_session_id, ReplayFilter, StreamCipher,
+    build_chameleon_server_hello, build_chameleon_server_hello_v2, derive_master_key,
+    derive_session_keys, derive_v2_session_keys, encrypt_tls_frame, extract_client_key_share,
+    extract_http_auth, read_decrypted_frame, read_tls_frame,
+    verify_auth_session_id_versioned, AuthVersion,
+    extract_session_id, verify_auth_session_id, ReplayFilter, StreamCipher,
     CMD_CONNECT, CMD_UDP_ASSOCIATE, HTTP_UPGRADE_RESPONSE,
 };
 use crate::socks5::{pack_tunnel_udp, unpack_tunnel_udp, TargetAddress};
@@ -23,6 +27,7 @@ pub struct ServerConfig {
 pub async fn run_server(config: ServerConfig) -> Result<()> {
     let master_key = Arc::new(derive_master_key(&config.secret));
     let fallback_addr = config.fallback_addr;
+    let fail_limiter = Arc::new(FailLimiter::new());
     let replay_filter = Arc::new(ReplayFilter::new(120));
 
     let listener = TcpListener::bind(config.listen_addr).await?;
@@ -38,6 +43,8 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
             Ok((socket, peer_addr)) => {
                 let master_key = Arc::clone(&master_key);
                 let replay_filter = Arc::clone(&replay_filter);
+                let replay_filter = Arc::clone(&replay_filter);
+                let fail_limiter = Arc::clone(&fail_limiter);
                 tokio::spawn(async move {
                     if let Err(e) = socket.set_nodelay(true) {
                         debug!("Failed to set TCP_NODELAY: {}", e);
@@ -49,6 +56,7 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
                         master_key,
                         fallback_addr,
                         replay_filter,
+                        fail_limiter,
                     )
                     .await
                     {
@@ -107,12 +115,61 @@ fn target_desc(target: &TargetAddress) -> String {
     format!("{}:{}", host, port)
 }
 
+/// Reads one frame: v2 = TLS-wrapped record, v1 = bare AEAD frame.
+async fn read_session_frame<R: tokio::io::AsyncReadExt + Unpin>(
+    reader: &mut R,
+    decryptor: &mut StreamCipher,
+    is_v2: bool,
+) -> Result<Vec<u8>> {
+    if is_v2 {
+        read_tls_frame(reader, decryptor).await
+    } else {
+        read_decrypted_frame(reader, decryptor).await
+    }
+}
+
+/// Encrypts one frame: v2 = TLS-wrapped record, v1 = bare AEAD frame.
+fn send_frame(encryptor: &mut StreamCipher, payload: &[u8], is_v2: bool) -> Result<Vec<u8>> {
+    if is_v2 {
+        encrypt_tls_frame(encryptor, payload, None)
+    } else {
+        encryptor.encrypt_frame(payload, 16)
+    }
+}
+
+/// Sliding-window per-source limiter for failed MAC verifications: an attacker
+/// must not be able to grind MAC candidates (16-byte truncated MAC) for free.
+struct FailLimiter {
+    map: Mutex<HashMap<std::net::IpAddr, Vec<Instant>>>,
+}
+
+impl FailLimiter {
+    fn new() -> Self {
+        Self {
+            map: Mutex::new(HashMap::new()),
+        }
+    }
+    /// Returns false when the source exceeded 60 failures in the last 60s.
+    fn check(&self, ip: std::net::IpAddr) -> bool {
+        let mut m = self.map.lock().unwrap();
+        let now = Instant::now();
+        let e = m.entry(ip).or_default();
+        e.retain(|t| now.duration_since(*t) < Duration::from_secs(60));
+        if e.len() >= 60 {
+            return false;
+        }
+        e.push(now);
+        true
+    }
+}
+
 async fn handle_connection(
     mut client_sock: TcpStream,
     peer_addr: SocketAddr,
     master_key: Arc<[u8; 32]>,
     fallback_addr: SocketAddr,
     replay_filter: Arc<ReplayFilter>,
+    fail_limiter: Arc<FailLimiter>,
 ) -> Result<()> {
     // Robustly read initial handshake with timeout and TCP segmentation assembly
     let initial_buf = match read_handshake_with_timeout(&mut client_sock).await {
@@ -120,24 +177,38 @@ async fn handle_connection(
         Err(_) => return Ok(()),
     };
 
-    // Check if this is an authentic NOVL handshake (with Anti-Replay verification):
-    let (is_authenticated, session_id, is_http) = if initial_buf.starts_with(&[0x16]) {
-        let sid = extract_session_id(&initial_buf);
-        let ok = sid
-            .as_ref()
-            .is_some_and(|s| verify_auth_session_id(&master_key, s, &replay_filter));
-        (ok, sid, false)
-    } else if initial_buf.starts_with(b"GET ") || initial_buf.starts_with(b"POST ") {
-        let sid = extract_http_auth(&initial_buf);
-        let ok = sid
-            .as_ref()
-            .is_some_and(|s| verify_auth_session_id(&master_key, s, &replay_filter));
-        (ok, sid, true)
+    // v2 capable handshake? extract both token and ephemeral key share.
+    let client_epk: Option<[u8; 32]> = if initial_buf.starts_with(&[0x16]) {
+        extract_client_key_share(&initial_buf)
     } else {
-        (false, None, false)
+        None
     };
 
-    if !is_authenticated {
+    // Check if this is an authentic NOVL handshake (with Anti-Replay verification):
+    let (auth, session_id, is_http) = if initial_buf.starts_with(&[0x16]) {
+        let sid = extract_session_id(&initial_buf);
+        let ver = sid.as_ref().and_then(|s| {
+            verify_auth_session_id_versioned(&master_key, s, &replay_filter, client_epk.as_ref())
+        });
+        (ver, sid, false)
+    } else if initial_buf.starts_with(b"GET ") || initial_buf.starts_with(b"POST ") {
+        let sid = extract_http_auth(&initial_buf);
+        // HTTP mode stays v1 for now.
+        let ver = sid.as_ref().and_then(|s| {
+            verify_auth_session_id_versioned(&master_key, s, &replay_filter, None)
+                .filter(|v| *v == AuthVersion::V1)
+        });
+        (ver, sid, true)
+    } else {
+        (None, None, false)
+    };
+
+    if auth.is_none() {
+        // Rate-limit MAC grinding per source IP.
+        if !fail_limiter.check(peer_addr.ip()) {
+            debug!("Dropping unauthenticated flood from {}", peer_addr);
+            return Ok(());
+        }
         // Unauthenticated traffic, active probe, or replay: forward to fallback server
         warn!(
             "Unauthenticated client or probe from {}; proxying to fallback {}",
@@ -164,24 +235,65 @@ async fn handle_connection(
     }
 
     let session_id = session_id.unwrap();
+    let auth_version = auth.unwrap();
     info!(
-        "Authenticated client {} connected (mode: {})",
+        "Authenticated client {} connected (mode: {}, proto: v{})",
         peer_addr,
         if is_http {
             "HTTP-Upgrade"
         } else {
             "TLS-Chameleon"
-        }
+        },
+        if auth_version == AuthVersion::V2 { 2 } else { 1 }
     );
 
+    let is_v2 = auth_version == AuthVersion::V2 && !is_http;
+    let mut server_epk = [0u8; 32];
+    let mut v2_hello_bytes: Vec<u8> = Vec::new();
+
     // Derive session encryption keys
-    let keys = derive_session_keys(&master_key, &session_id);
+    let keys = if is_v2 {
+        let client_epk = client_epk
+            .expect("v2 token verified but no key share extracted");
+        // One server ephemeral keypair serves both the wire hello and the ECDH,
+        // so the client's proof check binds to the exact key used for keys.
+        let server_esk_bytes = {
+            let mut b = [0u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut b);
+            b
+        };
+        let server_esk = x25519_dalek::StaticSecret::from(server_esk_bytes);
+        server_epk = x25519_dalek::PublicKey::from(&server_esk).to_bytes();
+
+        let hello = build_chameleon_server_hello_v2(
+            Some(&master_key),
+            Some(&session_id),
+            Some(&client_epk),
+            &server_epk,
+        );
+        v2_hello_bytes = hello;
+
+        let shared = {
+            let pk = x25519_dalek::PublicKey::from(client_epk);
+            let sh = server_esk.diffie_hellman(&pk);
+            if !sh.was_contributory() {
+                bail!("client ephemeral key rejected");
+            }
+            sh.to_bytes()
+        };
+        derive_v2_session_keys(&master_key, &session_id, &client_epk, &server_epk, &shared)?
+    } else {
+        derive_session_keys(&master_key, &session_id)
+    };
     let mut decryptor = StreamCipher::new(&keys.client_enc_key);
     let mut encryptor = StreamCipher::new(&keys.server_enc_key);
 
     // Send handshake acknowledgement disguised according to transport mode
     if is_http {
         client_sock.write_all(HTTP_UPGRADE_RESPONSE).await?;
+        client_sock.flush().await?;
+    } else if is_v2 {
+        client_sock.write_all(&v2_hello_bytes).await?;
         client_sock.flush().await?;
     } else {
         let server_hello = build_chameleon_server_hello();
@@ -192,7 +304,7 @@ async fn handle_connection(
     let (mut client_rx, mut client_tx) = client_sock.into_split();
 
     // Read initial command frame
-    let cmd_frame = read_decrypted_frame(&mut client_rx, &mut decryptor).await?;
+    let cmd_frame = read_session_frame(&mut client_rx, &mut decryptor, is_v2).await?;
     if cmd_frame.is_empty() {
         return Ok(());
     }
@@ -204,14 +316,14 @@ async fn handle_connection(
             Ok(s) => Arc::new(s),
             Err(e) => {
                 error!("Failed to bind server UDP socket: {}", e);
-                let fail_frame = encryptor.encrypt_frame(&[0x01], 16)?;
+                let fail_frame = send_frame(&mut encryptor, &[0x01], is_v2)?;
                 let _ = client_tx.write_all(&fail_frame).await;
                 return Ok(());
             }
         };
 
         // Send success frame to client
-        let success_frame = encryptor.encrypt_frame(&[0x00], 16)?;
+        let success_frame = send_frame(&mut encryptor, &[0x00], is_v2)?;
         client_tx.write_all(&success_frame).await?;
         client_tx.flush().await?;
 
@@ -221,11 +333,12 @@ async fn handle_connection(
         // Task 1: Client Frame (TCP) -> Target UDP
         let udp_sock_tx = Arc::clone(&udp_sock);
         let c2u = async move {
-            while let Ok(frame) = read_decrypted_frame(&mut client_rx, &mut decryptor).await {
+            while let Ok(frame) = read_session_frame(&mut client_rx, &mut decryptor, is_v2).await {
                 if frame.is_empty() {
                     break;
                 }
-                if let Ok((target, payload)) = unpack_tunnel_udp(&frame) {
+                match unpack_tunnel_udp(&frame) {
+                Ok((target, payload)) => {
                     // Resolve and reject restricted/private targets (N03).
                     let addrs = resolve_target_addrs(&target).await;
                     if addrs.iter().any(|a| ip_is_restricted(a.ip())) {
@@ -239,7 +352,11 @@ async fn handle_connection(
                         if let Err(e) = udp_sock_tx.send_to(payload, *addr).await {
                             debug!("UDP send to {} error: {}", addr, e);
                         }
+                    } else {
                     }
+                }
+                Err(e) => {
+                }
                 }
             }
         };
@@ -284,7 +401,7 @@ async fn handle_connection(
                 } else {
                     0
                 };
-                match encryptor.encrypt_frame(&pkt, pad) {
+                match send_frame(&mut encryptor, &pkt, is_v2) {
                     Ok(frame) => {
                         if let Err(e) = client_tx.write_all(&frame).await {
                             debug!("Write to client UDP stream failed: {}", e);
@@ -325,7 +442,7 @@ async fn handle_connection(
             target_desc(&target),
             peer_addr
         );
-        let fail_frame = encryptor.encrypt_frame(&[0x01], 16)?;
+        let fail_frame = send_frame(&mut encryptor, &[0x01], is_v2)?;
         let _ = client_tx.write_all(&fail_frame).await;
         return Ok(());
     }
@@ -335,7 +452,7 @@ async fn handle_connection(
             target_desc(&target),
             peer_addr
         );
-        let fail_frame = encryptor.encrypt_frame(&[0x01], 16)?;
+        let fail_frame = send_frame(&mut encryptor, &[0x01], is_v2)?;
         let _ = client_tx.write_all(&fail_frame).await;
         return Ok(());
     }
@@ -347,20 +464,20 @@ async fn handle_connection(
         Ok(Ok(s)) => {
             let _ = s.set_nodelay(true);
             crate::protocol::configure_tcp_keepalive(&s);
-            let success_frame = encryptor.encrypt_frame(&[0x00], 16)?;
+            let success_frame = send_frame(&mut encryptor, &[0x00], is_v2)?;
             client_tx.write_all(&success_frame).await?;
             client_tx.flush().await?;
             s
         }
         Ok(Err(e)) => {
             warn!("Failed to connect to {}: {}", target_desc(&target), e);
-            let fail_frame = encryptor.encrypt_frame(&[0x01], 16)?;
+            let fail_frame = send_frame(&mut encryptor, &[0x01], is_v2)?;
             let _ = client_tx.write_all(&fail_frame).await;
             return Ok(());
         }
         Err(_) => {
             warn!("Connect timeout (6s) to {}", target_desc(&target));
-            let fail_frame = encryptor.encrypt_frame(&[0x01], 16)?;
+            let fail_frame = send_frame(&mut encryptor, &[0x01], is_v2)?;
             let _ = client_tx.write_all(&fail_frame).await;
             return Ok(());
         }
@@ -370,7 +487,7 @@ async fn handle_connection(
 
     // Pipe 1: Client (Encrypted) -> Target (Plaintext)
     let c2t = async move {
-        while let Ok(data) = read_decrypted_frame(&mut client_rx, &mut decryptor).await {
+        while let Ok(data) = read_session_frame(&mut client_rx, &mut decryptor, is_v2).await {
             if data.is_empty() {
                 break;
             }
@@ -397,7 +514,7 @@ async fn handle_connection(
                         } else {
                             0
                         };
-                        match encryptor.encrypt_frame(chunk, pad) {
+                        match send_frame(&mut encryptor, chunk, is_v2) {
                             Ok(frame) => {
                                 if let Err(e) = client_tx.write_all(&frame).await {
                                     debug!("Write to client failed: {}", e);
