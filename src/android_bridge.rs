@@ -153,11 +153,9 @@ fn parse_settings(settings: &str) -> ParsedSettings {
     for line in settings.lines() {
         let line = line.trim();
         if line.starts_with("public_key=") {
-            if !saw_first_peer {
-                saw_first_peer = true;
-                first_peer_endpoint = cur_endpoint.take();
-                first_peer_secret = cur_secret.take();
-            } else {
+            if saw_first_peer {
+                // Attributes of the first peer have all been read; stop before
+                // a second peer (the engine supports only one remote server).
                 break;
             }
             in_peer = true;
@@ -189,6 +187,15 @@ fn parse_settings(settings: &str) -> ParsedSettings {
                 }
             }
         }
+    }
+
+    // The peer attributes were collected inside the loop; the first peer's
+    // values are whatever accumulated before the second "public_key=" line.
+    if first_peer_endpoint.is_none() {
+        first_peer_endpoint = cur_endpoint;
+    }
+    if first_peer_secret.is_none() {
+        first_peer_secret = cur_secret;
     }
 
     ParsedSettings {
@@ -477,4 +484,37 @@ pub unsafe extern "system" fn Java_com_wireguard_android_backend_GoBackend_wgVer
     _class: jclass,
 ) -> jstring {
     string_to_jstring(env, concat!(env!("CARGO_PKG_VERSION"), "-novl"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_first_peer_endpoint_and_psk() {
+        let settings = "private_key=aaa\nreplace_peers=true\n\
+            public_key=bbb\nallowed_ip=0.0.0.0/0\n\
+            endpoint=89.127.214.155:7443\npreshared_key=deadbeef\n\
+            dns=1.1.1.1\ndns=8.8.8.8\n";
+        let p = parse_settings(settings);
+        assert_eq!(p.endpoint.as_ref().unwrap().to_string(), "89.127.214.155:7443");
+        assert_eq!(p.secret.as_deref(), Some("deadbeef"));
+        assert_eq!(p.dns.to_string(), "8.8.8.8"); // последний dns= wins, как в wg
+    }
+
+    #[test]
+    fn stops_at_second_peer() {
+        let settings = "public_key=bbb\nendpoint=1.2.3.4:1\npreshared_key=k1\n\
+            public_key=ccc\nendpoint=5.6.7.8:2\npreshared_key=k2\n";
+        let p = parse_settings(settings);
+        assert_eq!(p.endpoint.as_ref().unwrap().to_string(), "1.2.3.4:1");
+        assert_eq!(p.secret.as_deref(), Some("k1"));
+    }
+
+    #[test]
+    fn missing_endpoint_is_none() {
+        let p = parse_settings("public_key=bbb\npreshared_key=k\n");
+        assert!(p.endpoint.is_none());
+        assert_eq!(p.secret.as_deref(), Some("k"));
+    }
 }
