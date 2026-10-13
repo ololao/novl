@@ -193,11 +193,10 @@ async fn handle_connection(
         (ver, sid, false)
     } else if initial_buf.starts_with(b"GET ") || initial_buf.starts_with(b"POST ") {
         let sid = extract_http_auth(&initial_buf);
-        // HTTP mode stays v1 for now.
-        let ver = sid.as_ref().and_then(|s| {
-            verify_auth_session_id_versioned(&master_key, s, &replay_filter, None)
-                .filter(|v| *v == AuthVersion::V1)
-        });
+        // HTTP mode has no key_share channel for the ECDH binding; accept both
+        // protocol versions there (v2 tokens without epk binding).
+        let ver =
+            sid.as_ref().and_then(|s| verify_auth_session_id_versioned(&master_key, s, &replay_filter, None));
         (ver, sid, true)
     } else {
         (None, None, false)
